@@ -1,4 +1,6 @@
 """
+Remember to create .streamlit folder with secrets.toml file with an api_key value
+
 To support pdf conversion, wkhtmltopdf needs to be installed on the system:
 For Ubuntu/Debian: sudo apt-get install wkhtmltopdf
 For macOS: brew install wkhtmltopdf
