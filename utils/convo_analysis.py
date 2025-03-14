@@ -148,11 +148,12 @@ def summarize_each_cluster(clusters: dict, product_description: str,
         joined_sentences = "\n".join(sentences)
         theme, description, sample_sentences = summarize_sentences(joined_sentences, product_description,
                                       user_description, api_key)
-        summaries[cluster_id] = {
-            "theme": theme,
-            "description": description,
-            "sample_sentences": sample_sentences,
-        }
+        if keep_theme(theme, description, product_description, user_description, api_key):
+            summaries[cluster_id] = {
+                "theme": theme,
+                "description": description,
+                "sample_sentences": sample_sentences,
+            }
     return summaries
     
 def summarize_sentences(sentences: str, product_description: str,
@@ -169,18 +170,41 @@ def summarize_sentences(sentences: str, product_description: str,
     SENTENCES:
     {sentences}
     
-    Provide only the theme, a short description, and 3-5 sample sentences from the list above that help
-    support your choice of the theme and the description. Here is the response format
+    Provide only a concise but complete description of the theme with a summary of the content within these sentences, the theme title, 
+    and 2-5 sample sentences from the list above that help support your choice of the theme and the description. 
+    Respond in the following format:
 
-    Theme: [theme]
-    Description: [description]
-    Sample Sentences: 
+    <description> your description here...  </description>
+    <theme> your theme title here...  </theme>
+    <sample_sentences>
     1. [sample_sentence]
     2. [sample_sentence]
     ...
+    </sample_sentences>
     """
     output = call_llm(prompt, api_key)
-    theme, rest = output.split("Description: ")
-    description, sample_sentences = rest.split("Sample Sentences: ")
-    theme = theme.split("Theme")[-1].strip()
+    theme = output.split("<theme>")[1].split("</theme>")[0].strip()
+    description = output.split("<description>")[1].split("</description>")[0].strip()
+    sample_sentences = output.split("<sample_sentences>")[1].split("</sample_sentences>")[0].strip()
     return theme, description, sample_sentences
+
+
+def keep_theme(theme: str, theme_desc: str, product_description: str, user_description: str, api_key: str) -> bool:
+    prompt = f"""An automated analysis platform for user research interviews has discovered the following theme 
+    and description based on a cluster of sentences from user interviews for a certain product and user group description.
+
+    Theme: {theme}
+    Description: {theme_desc}
+    Product Description: {product_description}
+    User-group Description: {user_description}
+
+    Your task is to decide if this theme and description is relevant to the product and user group. For instance, some
+    themes may be about clusters of introductory sentences or interjections that do not directly relate to user research 
+    insights. Take at least 3-5 steps to reason through your answer but take more steps, as needed. 
+    Include all of your reasoning within <thinking> tags. Then answer with only TRUE -- if the theme is relevant -- or FALSE --if the theme 
+    is irrelevant. For example, 
+    
+    <thinking>Your reasoning here...</thinking> TRUE/FALSE """
+    output = call_llm(prompt, api_key)
+    response = output.split("</thinking>")[1].strip()
+    return "TRUE" in response.upper()

@@ -1,3 +1,9 @@
+"""
+To support pdf conversion, wkhtmltopdf needs to be installed on the system:
+For Ubuntu/Debian: sudo apt-get install wkhtmltopdf
+For macOS: brew install wkhtmltopdf
+"""
+
 import streamlit as st
 from uxr_app.database import (
     init_db,
@@ -172,24 +178,25 @@ def project_main_page(project_uuid):
             building blocks for creating specific personas.
 
             Format your output as:
-            <Archetype Number 1>
+            <archetype-1>
             Name: [Archetype name]
             Description: [Archetype description]
-            </Archetype Number 1>
+            </archetype-1>
             ...
-            <Archetype Number 5>
+            <archetype-7>
             Name: [Archetype name]
             Description: [Archetype description]
-            </Archetype Number 5>
+            </archetype-7>
             """
             response = call_llm(prompt, st.secrets["api_key"])
-        archetypes_data = response.split("Name:")
+        archetypes_data = response.split("<archetype-")
         db = next(get_db()) #re-establish since call_llm closes it.
         for archetype_str in archetypes_data:
+            archetype_str = archetype_str.split(">")[1]
             if archetype_str.strip():
                 try:
                     name, desc = archetype_str.split("Description:", 1)
-                    name = name.strip()
+                    name = name.replace("Name: ", "").strip()
                     desc = desc.strip()
                     create_persona_archetype(db, project_uuid, name, desc)
                 except ValueError:
@@ -220,7 +227,7 @@ def project_main_page(project_uuid):
     st.header("Specific Personas")
     if st.button("Generate Personas"):
         archetypes = get_archetypes_by_project(db, project_uuid)
-        with st.spinner("Generating specific personas for each archetype... This might take a few moments."):
+        with st.spinner("Generating specific personas for each archetype... This will take a few moments, please do not navigate away..."):
             for archetype in archetypes:
                 prompt = f"""
                 Generate a specific user persona based on this archetype:
@@ -285,7 +292,7 @@ def project_main_page(project_uuid):
         else:
              st.error("Please generate the UXR Researcher Persona first.")
     #Process interviews
-    with st.spinner("Running interviews... This might take a few minutes, feel free to get a coffee but do NOT close this page."):
+    with st.spinner("Running interviews... This will take a few minutes, feel free to get a coffee but do NOT close this page or you will lose the interviews."):
         if st.session_state['interview_queue']:
             persona_uuid, uxr_persona_uuid = st.session_state['interview_queue'].pop(0) #get the oldest one.
             run_interview_simulation(persona_uuid, uxr_persona_uuid, project_uuid) #this also updates the session state.
@@ -300,7 +307,7 @@ def project_main_page(project_uuid):
     # --- Analyze Interviews ---
     st.header("Analyze Interviews")
     if st.button("Analyze"):
-        with st.spinner("Analyzing Interviews... This may take a few minutes, feel free to get a coffee but do NOT close this page."):
+        with st.spinner("Analyzing Interviews... This may take a few minutes, feel free to get a coffee but do NOT close this page or you will lose the analysis."):
             interviews = get_interviews_by_project(db, project_uuid)
             all_conversations = []
             for interview in interviews:
@@ -309,11 +316,276 @@ def project_main_page(project_uuid):
             cluster_summaries = summarize_each_cluster(clusters, st.session_state.product_desc, 
                                                     st.session_state.user_group_desc,
                                                     st.secrets["api_key"])
-        for cluster_id, summary in cluster_summaries.items():
-            with st.expander(f"Theme {summary["theme"]}"):
-                st.write(summary["description"])
+            st.session_state['cluster_summaries'] = cluster_summaries
+        for _, summary in cluster_summaries.items():
+            with st.expander(f"Theme: {summary["theme"]}"):
+                st.write(f"Description: {summary["description"]}")
+                st.write(f"Sample sentences:\n{summary['sample_sentences']}")
     # --- UXR Report ---
-    #TODO: Add Report Section.
+    st.header("UXR Report")
+    
+    if 'cluster_summaries' in st.session_state:
+        report_tab1, report_tab2 = st.tabs(["Generate Report", "Download Report"])
+        
+        with report_tab1:
+            st.subheader("Generate UXR Report")
+            report_title = st.text_input("Report Title", f"UXR Report: {project.project_name}")
+            
+            # Report sections configuration
+            include_exec_summary = st.checkbox("Include Executive Summary", value=True)
+            include_background = st.checkbox("Include Research Background", value=True)
+            include_demographics = st.checkbox("Include Participant Demographics", value=True)
+            include_key_findings = st.checkbox("Include Key Findings", value=True)
+            include_detailed_analysis = st.checkbox("Include Detailed Analysis", value=True)
+            include_recommendations = st.checkbox("Include Recommendations", value=True)
+            include_appendix = st.checkbox("Include Appendix (Raw Interview Data)", value=False)
+            
+            if st.button("Generate Report"):
+                with st.spinner("Generating comprehensive UXR report... This may take a few minutes."):
+                    # Get necessary data
+                    personas = get_personas_by_project(db, project_uuid)
+                    interviews = get_interviews_by_project(db, project_uuid)
+                    cluster_summaries = st.session_state['cluster_summaries']
+                    
+                    # Generate report content
+                    report_content = {}
+                    
+                    # Executive Summary
+                    if include_exec_summary:
+                        exec_summary_prompt = f"""
+                        Create an executive summary for a UX research report based on the following:
+                        
+                        Product: {project.product_desc}
+                        User Group: {project.user_group_desc}
+                        Key Themes: {', '.join([summary['theme'] for _, summary in cluster_summaries.items()])}
+                        
+                        The executive summary should be concise (150-250 words) and highlight the most important findings
+                        and recommendations. Focus on insights that would be most valuable for product development.
+                        """
+                        report_content['executive_summary'] = call_llm(exec_summary_prompt, st.secrets["api_key"])
+                    
+                    # Research Background
+                    if include_background:
+                        report_content['research_background'] = f"""
+                        ## Research Background
+                        
+                        **Project:** {project.project_name}
+                        
+                        **Product Description:** {project.product_desc}
+                        
+                        **Target User Group:** {project.user_group_desc}
+                        
+                        **Research Methodology:** This research was conducted using simulated interviews with AI-generated personas 
+                        representing the target user group. The interviews were designed to explore user needs, pain points, 
+                        and potential value propositions related to the product. Since personas were AI-generated, there may be 
+                        biases and caveats to the research. Please use these results as directional guidance for product development
+                        and validate all findings with customer interviews and product stakeholders.
+                        
+                        **Research Period:** {datetime.now().strftime("%B %Y")}
+                        """
+                    
+                    # Participant Demographics
+                    if include_demographics:
+                        demographics_text = "## Participant Demographics\n\n"
+                        for i, persona in enumerate(personas, 1):
+                            demographics_text += f"### Participant {i}: {persona.persona_name}\n\n"
+                            
+                            # Extract key demographic information from persona description
+                            demo_prompt = f"""
+                            Extract and summarize the key demographic information from this persona description in 3-4 sentences:
+                            
+                            {persona.persona_desc}
+                            
+                            Focus only on demographics, age, location, and background. Be concise.
+                            """
+                            demo_summary = call_llm(demo_prompt, st.secrets["api_key"])
+                            demographics_text += f"{demo_summary}\n\n"
+                        
+                        report_content['demographics'] = demographics_text
+                    
+                    # Key Findings
+                    if include_key_findings:
+                        findings_prompt = f"""
+                        Create a "Key Findings" section for a UX research report based on these themes:
+                        
+                        {json.dumps([summary for _, summary in cluster_summaries.items()])}
+                        
+                        For each theme, provide:
+                        1. A clear headline that captures the essence of the finding
+                        2. A brief explanation (2-3 sentences)
+                        3. The potential impact on the product design
+                        
+                        Format each finding as a separate section with markdown formatting.
+                        """
+                        report_content['key_findings'] = "## Key Findings\n\n" + call_llm(findings_prompt, st.secrets["api_key"])
+                    
+                    # Detailed Analysis
+                    if include_detailed_analysis:
+                        detailed_analysis = "## Detailed Analysis\n\n"
+                        for i, (_, summary) in enumerate(cluster_summaries.items(), 1):
+                            detailed_analysis += f"### Theme {i}: {summary['theme']}\n\n"
+                            detailed_analysis += f"{summary['description']}\n\n"
+                            detailed_analysis += "**Supporting Evidence:**\n\n"
+                            detailed_analysis += f"{summary['sample_sentences']}\n\n"
+                        
+                        report_content['detailed_analysis'] = detailed_analysis
+                    
+                    # Recommendations
+                    if include_recommendations:
+                        recommendations_prompt = f"""
+                        Create a "Recommendations" section for a UX research report based on these research findings:
+                        
+                        Product: {project.product_desc}
+                        User Group: {project.user_group_desc}
+                        Key Themes: {json.dumps([summary for _, summary in cluster_summaries.items()])}
+                        
+                        Provide 5-7 specific, actionable recommendations that:
+                        1. Address the key pain points identified
+                        2. Leverage the opportunities discovered
+                        3. Are realistic to implement
+                        
+                        Format each recommendation with:
+                        - A clear, actionable title
+                        - A brief explanation of the recommendation
+                        - The expected impact or benefit
+                        
+                        Use markdown formatting.
+                        """
+                        report_content['recommendations'] = "## Recommendations\n\n" + call_llm(recommendations_prompt, st.secrets["api_key"])
+                    
+                    # Appendix
+                    if include_appendix:
+                        appendix = "## Appendix: Raw Interview Data\n\n"
+                        for i, interview in enumerate(interviews, 1):
+                            persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
+                            appendix += f"### Interview {i}: Conversation with {persona.persona_name}\n\n"
+                            
+                            conversation = json.loads(interview.interview_transcript)
+                            for j, turn in enumerate(conversation, 1):
+                                appendix += f"**Researcher:** {turn['researcher']}\n\n"
+                                appendix += f"**{persona.persona_name}:** {turn['user']}\n\n"
+                            
+                            appendix += "---\n\n"
+                        
+                        report_content['appendix'] = appendix
+                    
+                    # Compile full report
+                    full_report = f"# {report_title}\n\n"
+                    
+                    if include_exec_summary:
+                        full_report += "## Executive Summary\n\n"
+                        full_report += report_content['executive_summary'] + "\n\n"
+                    
+                    for section in ['research_background', 'demographics', 'key_findings', 
+                                   'detailed_analysis', 'recommendations', 'appendix']:
+                        if section in report_content:
+                            full_report += report_content[section] + "\n\n"
+                    
+                    # Store the report in session state
+                    st.session_state['uxr_report'] = full_report
+                    
+                # Display the generated report
+                st.markdown("### Report Preview")
+                st.markdown(st.session_state['uxr_report'])
+        
+        with report_tab2:
+            if 'uxr_report' in st.session_state:
+                st.subheader("Download Report")
+                
+                # Generate PDF
+                try:
+                    import pdfkit
+                    from jinja2 import Template
+                    import tempfile
+                    import base64
+                    
+                    # Create HTML from markdown
+                    import markdown
+                    html_content = markdown.markdown(st.session_state['uxr_report'])
+                    
+                    # Apply basic styling
+                    html_template = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta charset="UTF-8">
+                        <title>{{ title }}</title>
+                        <style>
+                            body { font-family: Arial, sans-serif; line-height: 1.6; margin: 40px; }
+                            h1 { color: #333366; border-bottom: 1px solid #cccccc; padding-bottom: 10px; }
+                            h2 { color: #333366; margin-top: 30px; border-bottom: 1px solid #eeeeee; padding-bottom: 5px; }
+                            h3 { color: #444444; }
+                            blockquote { background-color: #f9f9f9; border-left: 4px solid #cccccc; padding: 10px; margin: 20px 0; }
+                            table { border-collapse: collapse; width: 100%; }
+                            th, td { border: 1px solid #dddddd; padding: 8px; text-align: left; }
+                            th { background-color: #f2f2f2; }
+                            .footer { margin-top: 50px; text-align: center; color: #666666; font-size: 0.8em; }
+                        </style>
+                    </head>
+                    <body>
+                        {{ content }}
+                        <div class="footer">
+                            Generated on {{ date }} with PoorMan's UXR
+                        </div>
+                    </body>
+                    </html>
+                    """
+                    
+                    template = Template(html_template)
+                    html = template.render(
+                        title=report_title,
+                        content=html_content,
+                        date=datetime.now().strftime("%B %d, %Y")
+                    )
+                    
+                    # Create PDF
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+                        pdf_path = f.name
+                    
+                    # Configure PDF options
+                    options = {
+                        'page-size': 'A4',
+                        'margin-top': '20mm',
+                        'margin-right': '20mm',
+                        'margin-bottom': '20mm',
+                        'margin-left': '20mm',
+                        'encoding': "UTF-8",
+                        'no-outline': None
+                    }
+                    
+                    # Generate PDF
+                    pdfkit.from_string(html, pdf_path, options=options)
+                    
+                    # Create download button
+                    with open(pdf_path, "rb") as pdf_file:
+                        pdf_bytes = pdf_file.read()
+                    
+                    st.download_button(
+                        label="Download Report as PDF",
+                        data=pdf_bytes,
+                        file_name=f"{project.project_name}_UXR_Report.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # Clean up temporary file
+                    import os
+                    os.unlink(pdf_path)
+                    
+                except ImportError:
+                    st.warning("PDF generation requires additional packages. Please install pdfkit and jinja2.")
+                    
+                # Also provide markdown download option as fallback
+                st.download_button(
+                    label="Download Report as Markdown",
+                    data=st.session_state['uxr_report'],
+                    file_name=f"{project.project_name}_UXR_Report.md",
+                    mime="text/markdown"
+                )
+            else:
+                st.info("Please generate a report first.")
+    else:
+        st.info("Please analyze interviews first to generate a report.")
+    
     db.close()
 
 # --- Main App Logic ---
