@@ -28,12 +28,17 @@ from uxr_app.database import (
     update_uxr_researcher,
     Persona,
     UXRResearcher,
+    Project,
+    Interview,
+    PersonaArchetype,
 )
 import json
 from utils.interview_utils import get_researcher_persona, simulate_interview
 from utils.convo_analysis import call_llm, cluster_sentences, summarize_each_cluster
 import time
 from datetime import datetime
+import uuid
+import re
 
 # Initialize the database
 init_db()
@@ -45,6 +50,19 @@ if 'logged_in' not in st.session_state:
     st.session_state['current_project_uuid'] = None
     st.session_state['interview_queue'] = []  # (persona_uuid, uxr_persona_uuid)
     st.session_state['interview_status'] = {}  # interview_uuid: status
+    st.session_state['guest_mode'] = False  # New: track if user is in guest mode
+    st.session_state['guest_user_id'] = None  # New: temporary user ID for guests
+    st.session_state['guest_projects'] = []  # New: track projects created as guest
+
+# Add a function to handle guest user creation
+def create_guest_user():
+    """Create a temporary guest user and return the user_id"""
+    db = next(get_db())
+    guest_email = f"guest_{uuid.uuid4().hex[:8]}@temp.uxr"
+    temp_password = uuid.uuid4().hex
+    user = create_user(db, guest_email, temp_password)
+    db.close()
+    return user.user_id, guest_email, temp_password
 
 # --- Helper function for simulating interviews ---
 def run_interview_simulation(persona_uuid, uxr_persona_uuid, project_uuid):
@@ -127,12 +145,63 @@ def signup_page():
 
 def create_project_page():
     st.title("Create New Project")
+
+    # Check user's project count
+    db = next(get_db())
+    # Get all projects for the user, ordered by creation date
+    user_projects = db.query(Project).filter(Project.user_id == st.session_state['user_id']).order_by(Project.creation_date).all()
+    project_count = len(user_projects)
+    db.close()
+    
+    # Display warning if at project limit
+    if project_count >= 5:
+        st.warning(f"You currently have {project_count} projects. Creating a new project will delete your oldest project.")
+        if not st.checkbox("I understand and want to continue"):
+            st.info("Please delete an existing project or check the box above to continue.")
+            return
+        
+        # If user agrees to continue, prepare to delete oldest project
+        oldest_project = user_projects[0]
+        st.warning(f"Creating a new project will delete: '{oldest_project.project_name}'")
+    
     # Project Name will be generated, but user can change
     user_group_desc = st.text_area("Broad User Group Description", placeholder="Example: University-enrolled engineering students")
     product_desc = st.text_area("General Product Category/Type", placeholder="Example: A mobile app for collaborative note-taking")
 
     if st.button("Create Project"):
         db = next(get_db())
+
+        # Delete oldest project if at the limit
+        if project_count >= 5:
+            oldest_project_id = user_projects[0].project_uuid
+            
+            # Delete associated records first (cascade delete isn't automatic)
+            # Delete interviews
+            interviews = db.query(Interview).filter(Interview.project_uuid == oldest_project_id).all()
+            for interview in interviews:
+                db.delete(interview)
+            
+            # Delete personas
+            personas = db.query(Persona).filter(Persona.project_uuid == oldest_project_id).all()
+            for persona in personas:
+                db.delete(persona)
+                
+            # Delete UX researchers
+            researchers = db.query(UXRResearcher).filter(UXRResearcher.project_uuid == oldest_project_id).all()
+            for researcher in researchers:
+                db.delete(researcher)
+                
+            # Delete persona archetypes
+            archetypes = db.query(PersonaArchetype).filter(PersonaArchetype.project_uuid == oldest_project_id).all()
+            for archetype in archetypes:
+                db.delete(archetype)
+            
+            # Delete the project itself
+            db.delete(oldest_project)
+            
+            db.commit()
+            st.success(f"Project '{oldest_project.project_name}' has been deleted to make room for your new project.")
+
         with st.spinner("Creating project... Please wait."):
             # LLM generated project name.
             prompt = f"""
@@ -149,6 +218,13 @@ def create_project_page():
         st.session_state['project_name'] = project.project_name
         st.session_state['user_group_desc'] = user_group_desc #store in session state for later
         st.session_state['product_desc'] = product_desc #store in session state for later
+        
+        # Add project to guest projects list if in guest mode
+        if st.session_state.get('guest_mode', False):
+            if 'guest_projects' not in st.session_state:
+                st.session_state['guest_projects'] = []
+            st.session_state['guest_projects'].append(project.project_uuid)
+
         db.close()
         st.success(f"Project '{project_name}' created!")
         st.experimental_rerun()
@@ -323,6 +399,7 @@ def project_main_page(project_uuid):
             with st.expander(f"Theme: {summary["theme"]}"):
                 st.write(f"Description: {summary["description"]}")
                 st.write(f"Sample sentences:\n{summary['sample_sentences']}")
+    
     # --- UXR Report ---
     st.header("UXR Report")
     
@@ -343,148 +420,153 @@ def project_main_page(project_uuid):
             include_appendix = st.checkbox("Include Appendix (Raw Interview Data)", value=False)
             
             if st.button("Generate Report"):
-                with st.spinner("Generating comprehensive UXR report... This may take a few minutes."):
-                    # Get necessary data
-                    personas = get_personas_by_project(db, project_uuid)
-                    interviews = get_interviews_by_project(db, project_uuid)
-                    cluster_summaries = st.session_state['cluster_summaries']
-                    
-                    # Generate report content
-                    report_content = {}
-                    
-                    # Executive Summary
-                    if include_exec_summary:
-                        exec_summary_prompt = f"""
-                        Create an executive summary for a UX research report based on the following:
+                # Check if user is in guest mode
+                if st.session_state.get('guest_mode', False):
+                    st.session_state['show_auth_modal'] = True
+                    st.warning("Please log in or create an account to generate and download reports.")
+                else:
+                    with st.spinner("Generating comprehensive UXR report... This may take a few minutes."):
+                        # Get necessary data
+                        personas = get_personas_by_project(db, project_uuid)
+                        interviews = get_interviews_by_project(db, project_uuid)
+                        cluster_summaries = st.session_state['cluster_summaries']
                         
-                        Product: {project.product_desc}
-                        User Group: {project.user_group_desc}
-                        Key Themes: {', '.join([summary['theme'] for _, summary in cluster_summaries.items()])}
+                        # Generate report content
+                        report_content = {}
                         
-                        The executive summary should be concise (150-250 words) and highlight the most important findings
-                        and recommendations. Focus on insights that would be most valuable for product development.
-                        """
-                        report_content['executive_summary'] = call_llm(exec_summary_prompt, st.secrets["api_key"])
-                    
-                    # Research Background
-                    if include_background:
-                        report_content['research_background'] = f"""
-                        ## Research Background
-                        
-                        **Project:** {project.project_name}
-                        
-                        **Product Description:** {project.product_desc}
-                        
-                        **Target User Group:** {project.user_group_desc}
-                        
-                        **Research Methodology:** This research was conducted using simulated interviews with AI-generated personas 
-                        representing the target user group. The interviews were designed to explore user needs, pain points, 
-                        and potential value propositions related to the product. Since personas were AI-generated, there may be 
-                        biases and caveats to the research. Please use these results as directional guidance for product development
-                        and validate all findings with customer interviews and product stakeholders.
-                        
-                        **Research Period:** {datetime.now().strftime("%B %Y")}
-                        """
-                    
-                    # Participant Demographics
-                    if include_demographics:
-                        demographics_text = "## Participant Demographics\n\n"
-                        for i, persona in enumerate(personas, 1):
-                            demographics_text += f"### Participant {i}: {persona.persona_name}\n\n"
+                        # Executive Summary
+                        if include_exec_summary:
+                            exec_summary_prompt = f"""
+                            Create an executive summary for a UX research report based on the following:
                             
-                            # Extract key demographic information from persona description
-                            demo_prompt = f"""
-                            Extract and summarize the key demographic information from this persona description in 3-4 sentences:
+                            Product: {project.product_desc}
+                            User Group: {project.user_group_desc}
+                            Key Themes: {', '.join([summary['theme'] for _, summary in cluster_summaries.items()])}
                             
-                            {persona.persona_desc}
-                            
-                            Focus only on demographics, age, location, and background. Be concise.
+                            The executive summary should be concise (150-250 words) and highlight the most important findings
+                            and recommendations. Focus on insights that would be most valuable for product development.
                             """
-                            demo_summary = call_llm(demo_prompt, st.secrets["api_key"])
-                            demographics_text += f"{demo_summary}\n\n"
+                            report_content['executive_summary'] = call_llm(exec_summary_prompt, st.secrets["api_key"])
                         
-                        report_content['demographics'] = demographics_text
-                    
-                    # Key Findings
-                    if include_key_findings:
-                        findings_prompt = f"""
-                        Create a "Key Findings" section for a UX research report based on these themes:
-                        
-                        {json.dumps([summary for _, summary in cluster_summaries.items()])}
-                        
-                        For each theme, provide:
-                        1. A clear headline that captures the essence of the finding
-                        2. A brief explanation (2-3 sentences)
-                        3. The potential impact on the product design
-                        
-                        Format each finding as a separate section with markdown formatting.
-                        """
-                        report_content['key_findings'] = "## Key Findings\n\n" + call_llm(findings_prompt, st.secrets["api_key"])
-                    
-                    # Detailed Analysis
-                    if include_detailed_analysis:
-                        detailed_analysis = "## Detailed Analysis\n\n"
-                        for i, (_, summary) in enumerate(cluster_summaries.items(), 1):
-                            detailed_analysis += f"### Theme {i}: {summary['theme']}\n\n"
-                            detailed_analysis += f"{summary['description']}\n\n"
-                            detailed_analysis += "**Supporting Evidence:**\n\n"
-                            detailed_analysis += f"{summary['sample_sentences']}\n\n"
-                        
-                        report_content['detailed_analysis'] = detailed_analysis
-                    
-                    # Recommendations
-                    if include_recommendations:
-                        recommendations_prompt = f"""
-                        Create a "Recommendations" section for a UX research report based on these research findings:
-                        
-                        Product: {project.product_desc}
-                        User Group: {project.user_group_desc}
-                        Key Themes: {json.dumps([summary for _, summary in cluster_summaries.items()])}
-                        
-                        Provide 5-7 specific, actionable recommendations that:
-                        1. Address the key pain points identified
-                        2. Leverage the opportunities discovered
-                        3. Are realistic to implement
-                        
-                        Format each recommendation with:
-                        - A clear, actionable title
-                        - A brief explanation of the recommendation
-                        - The expected impact or benefit
-                        
-                        Use markdown formatting.
-                        """
-                        report_content['recommendations'] = "## Recommendations\n\n" + call_llm(recommendations_prompt, st.secrets["api_key"])
-                    
-                    # Appendix
-                    if include_appendix:
-                        appendix = "## Appendix: Raw Interview Data\n\n"
-                        for i, interview in enumerate(interviews, 1):
-                            persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
-                            appendix += f"### Interview {i}: Conversation with {persona.persona_name}\n\n"
+                        # Research Background
+                        if include_background:
+                            report_content['research_background'] = f"""
+                            ## Research Background
                             
-                            conversation = json.loads(interview.interview_transcript)
-                            for j, turn in enumerate(conversation, 1):
-                                appendix += f"**Researcher:** {turn['researcher']}\n\n"
-                                appendix += f"**{persona.persona_name}:** {turn['user']}\n\n"
+                            **Project:** {project.project_name}
                             
-                            appendix += "---\n\n"
+                            **Product Description:** {project.product_desc}
+                            
+                            **Target User Group:** {project.user_group_desc}
+                            
+                            **Research Methodology:** This research was conducted using simulated interviews with AI-generated personas 
+                            representing the target user group. The interviews were designed to explore user needs, pain points, 
+                            and potential value propositions related to the product. Since personas were AI-generated, there may be 
+                            biases and caveats to the research. Please use these results as directional guidance for product development
+                            and validate all findings with customer interviews and product stakeholders.
+                            
+                            **Research Period:** {datetime.now().strftime("%B %Y")}
+                            """
                         
-                        report_content['appendix'] = appendix
-                    
-                    # Compile full report
-                    full_report = f"# {report_title}\n\n"
-                    
-                    if include_exec_summary:
-                        full_report += "## Executive Summary\n\n"
-                        full_report += report_content['executive_summary'] + "\n\n"
-                    
-                    for section in ['research_background', 'demographics', 'key_findings', 
-                                   'detailed_analysis', 'recommendations', 'appendix']:
-                        if section in report_content:
-                            full_report += report_content[section] + "\n\n"
-                    
-                    # Store the report in session state
-                    st.session_state['uxr_report'] = full_report
+                        # Participant Demographics
+                        if include_demographics:
+                            demographics_text = "## Participant Demographics\n\n"
+                            for i, persona in enumerate(personas, 1):
+                                demographics_text += f"### Participant {i}: {persona.persona_name}\n\n"
+                                
+                                # Extract key demographic information from persona description
+                                demo_prompt = f"""
+                                Extract and summarize the key demographic information from this persona description in 3-4 sentences:
+                                
+                                {persona.persona_desc}
+                                
+                                Focus only on demographics, age, location, and background. Be concise.
+                                """
+                                demo_summary = call_llm(demo_prompt, st.secrets["api_key"])
+                                demographics_text += f"{demo_summary}\n\n"
+                            
+                            report_content['demographics'] = demographics_text
+                        
+                        # Key Findings
+                        if include_key_findings:
+                            findings_prompt = f"""
+                            Create a "Key Findings" section for a UX research report based on these themes:
+                            
+                            {json.dumps([summary for _, summary in cluster_summaries.items()])}
+                            
+                            For each theme, provide:
+                            1. A clear headline that captures the essence of the finding
+                            2. A brief explanation (2-3 sentences)
+                            3. The potential impact on the product design
+                            
+                            Format each finding as a separate section with markdown formatting.
+                            """
+                            report_content['key_findings'] = "## Key Findings\n\n" + call_llm(findings_prompt, st.secrets["api_key"])
+                        
+                        # Detailed Analysis
+                        if include_detailed_analysis:
+                            detailed_analysis = "## Detailed Analysis\n\n"
+                            for i, (_, summary) in enumerate(cluster_summaries.items(), 1):
+                                detailed_analysis += f"### Theme {i}: {summary['theme']}\n\n"
+                                detailed_analysis += f"{summary['description']}\n\n"
+                                detailed_analysis += "**Supporting Evidence:**\n\n"
+                                detailed_analysis += f"{summary['sample_sentences']}\n\n"
+                            
+                            report_content['detailed_analysis'] = detailed_analysis
+                        
+                        # Recommendations
+                        if include_recommendations:
+                            recommendations_prompt = f"""
+                            Create a "Recommendations" section for a UX research report based on these research findings:
+                            
+                            Product: {project.product_desc}
+                            User Group: {project.user_group_desc}
+                            Key Themes: {json.dumps([summary for _, summary in cluster_summaries.items()])}
+                            
+                            Provide 5-7 specific, actionable recommendations that:
+                            1. Address the key pain points identified
+                            2. Leverage the opportunities discovered
+                            3. Are realistic to implement
+                            
+                            Format each recommendation with:
+                            - A clear, actionable title
+                            - A brief explanation of the recommendation
+                            - The expected impact or benefit
+                            
+                            Use markdown formatting.
+                            """
+                            report_content['recommendations'] = "## Recommendations\n\n" + call_llm(recommendations_prompt, st.secrets["api_key"])
+                        
+                        # Appendix
+                        if include_appendix:
+                            appendix = "## Appendix: Raw Interview Data\n\n"
+                            for i, interview in enumerate(interviews, 1):
+                                persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
+                                appendix += f"### Interview {i}: Conversation with {persona.persona_name}\n\n"
+                                
+                                conversation = json.loads(interview.interview_transcript)
+                                for j, turn in enumerate(conversation, 1):
+                                    appendix += f"**Researcher:** {turn['researcher']}\n\n"
+                                    appendix += f"**{persona.persona_name}:** {turn['user']}\n\n"
+                                
+                                appendix += "---\n\n"
+                            
+                            report_content['appendix'] = appendix
+                        
+                        # Compile full report
+                        full_report = f"# {report_title}\n\n"
+                        
+                        if include_exec_summary:
+                            full_report += "## Executive Summary\n\n"
+                            full_report += report_content['executive_summary'] + "\n\n"
+                        
+                        for section in ['research_background', 'demographics', 'key_findings', 
+                                    'detailed_analysis', 'recommendations', 'appendix']:
+                            if section in report_content:
+                                full_report += report_content[section] + "\n\n"
+                        
+                        # Store the report in session state
+                        st.session_state['uxr_report'] = full_report
                     
                 # Display the generated report
                 st.markdown("### Report Preview")
@@ -592,21 +674,107 @@ def project_main_page(project_uuid):
 
 # --- Main App Logic ---
 
-if not st.session_state['logged_in']:
-    choice = st.sidebar.selectbox("Navigation", ["Login", "Create Account"])
+if not st.session_state['logged_in'] and not st.session_state['guest_mode']:
+    choice = st.sidebar.selectbox("Navigation", ["Login", "Create Account", "Continue as Guest"])
     if choice == "Login":
         login_page()
-    else:
+    elif choice == "Create Account":
         signup_page()
+    else: # Continue as Guest
+        st.session_state['guest_mode'] = True
+        st.session_state['guest_user_id'], guest_email, guest_password = create_guest_user()
+        st.session_state['user_id'] = st.session_state['guest_user_id']
+        st.session_state['guest_email'] = guest_email
+        st.session_state['guest_password'] = guest_password
+        st.experimental_rerun()
 else:
-    st.sidebar.write(f"Logged in as: {st.session_state['user_id']}")
+    if st.session_state['guest_mode']:
+        st.sidebar.write("📝 Guest Mode")
+        st.sidebar.info("To save your work, please create an account before leaving")
+        if st.sidebar.button("Log in / Create Account"):
+            st.session_state['show_auth_modal'] = True
+    else:
+        st.sidebar.write(f"Logged in as: {st.session_state['user_id']}")
+
     if st.sidebar.button("Logout"):
         st.session_state['logged_in'] = False
         st.session_state['user_id'] = None
         st.session_state['current_project_uuid'] = None
+        st.session_state['guest_mode'] = False
+        st.session_state['guest_user_id'] = None
         st.experimental_rerun()
 
     if st.session_state['current_project_uuid'] is None:
         create_project_page()
     else:
         project_main_page(st.session_state['current_project_uuid'])
+
+# Add authentication modal for guest users when needed
+if st.session_state.get('show_auth_modal', False):
+    with st.sidebar.expander("Authentication Required", expanded=True):
+        auth_tab1, auth_tab2 = st.tabs(["Login", "Create Account"])
+        
+        with auth_tab1:
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            if st.button("Login", key="login_button"):
+                db = next(get_db())
+                user = get_user_by_email(db, email)
+                db.close()
+                if user and user.password == password:
+                    # Transfer guest data to logged in user
+                    if st.session_state['guest_user_id']:
+                        db = next(get_db())
+                        # Update projects to belong to the logged in user
+                        for project_uuid in st.session_state.get('guest_projects', []):
+                            project = get_project_by_uuid(db, project_uuid)
+                            if project:
+                                project.user_id = user.user_id
+                                db.commit()
+                        db.close()
+                    
+                    st.session_state['logged_in'] = True
+                    st.session_state['guest_mode'] = False
+                    st.session_state['user_id'] = user.user_id
+                    st.session_state['show_auth_modal'] = False
+                    st.success("Logged in successfully!")
+                    st.experimental_rerun()
+                else:
+                    st.error("Invalid credentials.")
+        
+        with auth_tab2:
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input("Password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            if st.button("Create Account", key="signup_button"):
+                if password != confirm_password:
+                    st.error("Passwords do not match.")
+                    return
+                if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+                    st.error("Please enter a valid email address.")
+                    return
+                
+                db = next(get_db())
+                if get_user_by_email(db, email):
+                    st.error("Email already exists.")
+                    db.close()
+                    return
+                
+                new_user = create_user(db, email, password)
+                
+                # Transfer guest data to new user
+                if st.session_state['guest_user_id']:
+                    # Update projects to belong to the new user
+                    for project_uuid in st.session_state.get('guest_projects', []):
+                        project = get_project_by_uuid(db, project_uuid)
+                        if project:
+                            project.user_id = new_user.user_id
+                            db.commit()
+                db.close()
+                
+                st.session_state['logged_in'] = True
+                st.session_state['guest_mode'] = False
+                st.session_state['user_id'] = new_user.user_id
+                st.session_state['show_auth_modal'] = False
+                st.success("Account created successfully! Your work has been transferred to your new account.")
+                st.experimental_rerun()
