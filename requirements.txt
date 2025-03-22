@@ -21,3 +21,4 @@ matplotlib>=3.7.0
 pdfkit
 jinja2
 markdown
+uuid

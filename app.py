@@ -119,7 +119,7 @@ def login_page():
             st.session_state['logged_in'] = True
             st.session_state['user_id'] = user.user_id
             st.success("Logged in successfully!")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Invalid credentials.")
 
@@ -141,7 +141,7 @@ def signup_page():
         create_user(db, email, password)  # Hash the password!
         db.close()
         st.success("Account created successfully! Please log in.")
-        st.experimental_rerun() #rerun to clear fields.
+        st.rerun() #rerun to clear fields.
 
 def create_project_page():
     st.title("Create New Project")
@@ -227,7 +227,7 @@ def create_project_page():
 
         db.close()
         st.success(f"Project '{project_name}' created!")
-        st.experimental_rerun()
+        st.rerun()
 
 def project_main_page(project_uuid):
     db = next(get_db())
@@ -270,17 +270,19 @@ def project_main_page(project_uuid):
         archetypes_data = response.split("<archetype-")
         db = next(get_db()) #re-establish since call_llm closes it.
         for archetype_str in archetypes_data:
-            archetype_str = archetype_str.split(">")[1]
-            if archetype_str.strip():
-                try:
-                    name, desc = archetype_str.split("Description:", 1)
-                    name = name.replace("Name: ", "").strip()
-                    desc = desc.strip()
-                    create_persona_archetype(db, project_uuid, name, desc)
-                except ValueError:
-                    st.error(f"Error parsing archetype: {archetype_str}")
+            if len(archetype_str) > 5:
+                archetype_str = archetype_str.split(">")[1]
+                archetype_str = archetype_str.split("</archetype-")[0]
+                if archetype_str.strip():
+                    try:
+                        name, desc = archetype_str.split("Description:", 1)
+                        name = name.replace("Name: ", "").strip()
+                        desc = desc.strip()
+                        create_persona_archetype(db, project_uuid, name, desc)
+                    except ValueError:
+                        st.error(f"Error parsing archetype: {archetype_str}")
         db.close()
-        st.experimental_rerun()
+        st.rerun()
 
     #display, edit, add archetypes.
     db = next(get_db()) #re-establish since call_llm closes it.
@@ -298,7 +300,7 @@ def project_main_page(project_uuid):
         new_arch_desc = st.text_area("Archetype Description")
         if st.button("Add Archetype", key = "add_new_archetype"):
             create_persona_archetype(db, project_uuid, new_arch_name, new_arch_desc)
-            st.experimental_rerun()
+            st.rerun()
 
 
     # --- Specific Personas ---
@@ -331,12 +333,12 @@ def project_main_page(project_uuid):
                 response = call_llm(prompt, st.secrets["api_key"])
                 try:
                     name, desc = response.split("Age:", 1)
-                    name = name.replace("Name:", "").strip()
-                    desc = "Age:" + desc.strip()
+                    name = name.replace("Name:", "").strip().replace("*", "").strip()
+                    desc = "Age:" + desc.strip().replace("*", "").strip()
                     create_persona(db, project_uuid, archetype.persona_arch_uuid, name, desc)
                 except ValueError:
                     st.error(f"Error parsing persona from response: {response}")
-        st.experimental_rerun()
+        st.rerun()
     #Display, edit, add personas.
     personas = get_personas_by_project(db, project_uuid)
     for persona in personas:
@@ -396,8 +398,8 @@ def project_main_page(project_uuid):
                                                     st.secrets["api_key"])
             st.session_state['cluster_summaries'] = cluster_summaries
         for _, summary in cluster_summaries.items():
-            with st.expander(f"Theme: {summary["theme"]}"):
-                st.write(f"Description: {summary["description"]}")
+            with st.expander(f"Theme: {summary['theme']}"):
+                st.write(f"Description: {summary['description']}")
                 st.write(f"Sample sentences:\n{summary['sample_sentences']}")
     
     # --- UXR Report ---
@@ -686,7 +688,7 @@ if not st.session_state['logged_in'] and not st.session_state['guest_mode']:
         st.session_state['user_id'] = st.session_state['guest_user_id']
         st.session_state['guest_email'] = guest_email
         st.session_state['guest_password'] = guest_password
-        st.experimental_rerun()
+        st.rerun()
 else:
     if st.session_state['guest_mode']:
         st.sidebar.write("📝 Guest Mode")
@@ -702,7 +704,7 @@ else:
         st.session_state['current_project_uuid'] = None
         st.session_state['guest_mode'] = False
         st.session_state['guest_user_id'] = None
-        st.experimental_rerun()
+        st.rerun()
 
     if st.session_state['current_project_uuid'] is None:
         create_project_page()
@@ -729,8 +731,7 @@ if st.session_state.get('show_auth_modal', False):
                         for project_uuid in st.session_state.get('guest_projects', []):
                             project = get_project_by_uuid(db, project_uuid)
                             if project:
-                                project.user_id = user.user_id
-                                db.commit()
+                                update_project(db, project_uuid, {'user_id': new_user.user_id})
                         db.close()
                     
                     st.session_state['logged_in'] = True
@@ -738,7 +739,7 @@ if st.session_state.get('show_auth_modal', False):
                     st.session_state['user_id'] = user.user_id
                     st.session_state['show_auth_modal'] = False
                     st.success("Logged in successfully!")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Invalid credentials.")
         
@@ -747,34 +748,35 @@ if st.session_state.get('show_auth_modal', False):
             password = st.text_input("Password", type="password", key="signup_password")
             confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
             if st.button("Create Account", key="signup_button"):
+                error_occurred = False
                 if password != confirm_password:
                     st.error("Passwords do not match.")
-                    return
+                    error_occurred = True
                 if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
                     st.error("Please enter a valid email address.")
-                    return
+                    error_occurred = True
                 
-                db = next(get_db())
-                if get_user_by_email(db, email):
-                    st.error("Email already exists.")
-                    db.close()
-                    return
-                
-                new_user = create_user(db, email, password)
-                
-                # Transfer guest data to new user
-                if st.session_state['guest_user_id']:
-                    # Update projects to belong to the new user
-                    for project_uuid in st.session_state.get('guest_projects', []):
-                        project = get_project_by_uuid(db, project_uuid)
-                        if project:
-                            project.user_id = new_user.user_id
-                            db.commit()
-                db.close()
-                
-                st.session_state['logged_in'] = True
-                st.session_state['guest_mode'] = False
-                st.session_state['user_id'] = new_user.user_id
-                st.session_state['show_auth_modal'] = False
-                st.success("Account created successfully! Your work has been transferred to your new account.")
-                st.experimental_rerun()
+                if not error_occurred:
+                    db = next(get_db())
+                    if get_user_by_email(db, email):
+                        st.error("Email already exists.")
+                        db.close()
+                    else:
+                        new_user = create_user(db, email, password)
+                        
+                        # Transfer guest data to new user
+                        if st.session_state['guest_user_id']:
+                            # Update projects to belong to the new user
+                            for project_uuid in st.session_state.get('guest_projects', []):
+                                project = get_project_by_uuid(db, project_uuid)
+                                if project:
+                                    project.user_id = new_user.user_id
+                                    db.commit()
+                        db.close()
+                        
+                        st.session_state['logged_in'] = True
+                        st.session_state['guest_mode'] = False
+                        st.session_state['user_id'] = new_user.user_id
+                        st.session_state['show_auth_modal'] = False
+                        st.success("Account created successfully! Your work has been transferred to your new account.")
+                        st.rerun()

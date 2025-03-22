@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, F
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.dialects.sqlite import BLOB  # Import BLOB
 from datetime import datetime
+from uuid import uuid4
 
 Base = declarative_base()
 
@@ -27,6 +28,7 @@ class Project(Base):
     product_desc = Column(Text)
     project_uuid = Column(String, unique=True)
     user_id = Column(String, ForeignKey("users.user_id"))
+    creation_date = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="projects")
     persona_archetypes = relationship("PersonaArchetype", back_populates="project")
@@ -34,20 +36,6 @@ class Project(Base):
     uxr_researcher = relationship("UXRResearcher", back_populates="project", uselist=False)
     interviews = relationship("Interview", back_populates="project")
 
-# --- Persona Archetype Table ---
-class PersonaArchetype(Base):
-    __tablename__ = "persona_archetypes"
-    id = Column(Integer, primary_key=True)
-    project_uuid = Column(String, ForeignKey("projects.project_uuid"))
-    persona_archetype_name = Column(String)
-    persona_archetype_desc = Column(Text)
-    persona_arch_uuid = Column(String, unique=True)
-
-    project = relationship("Project", back_populates="persona_archetypes")
-    personas = relationship("Persona", back_populates="archetype")
-
-
-# --- Persona Table ---
 class Persona(Base):
     __tablename__ = "personas"
     id = Column(Integer, primary_key=True)
@@ -58,8 +46,16 @@ class Persona(Base):
     persona_uuid = Column(String, unique=True)
 
     project = relationship("Project", back_populates="personas")
-    archetype = relationship("PersonaArchetype", back_populates="personas", foreign_keys=[persona_arch_uuids])
     interviews = relationship("Interview", back_populates="persona")
+
+class PersonaArchetype(Base):
+    __tablename__ = "persona_archetypes"
+    project_uuid = Column(String, ForeignKey("projects.project_uuid"))
+    persona_archetype_name = Column(String)
+    persona_archetype_desc = Column(Text)
+    persona_arch_uuid = Column(String, primary_key=True)
+
+    project = relationship("Project", back_populates="persona_archetypes")
 
 # --- UXR Researcher Table ---
 class UXRResearcher(Base):
@@ -149,7 +145,7 @@ def get_personas_by_project(db, project_uuid):
     return db.query(Persona).filter(Persona.project_uuid == project_uuid).all()
 
 def create_uxr_researcher(db, project_uuid, name, desc):
-    uxr_persona_uuid = hashlib.md5((project_uuid + name + desc).encode()).hexdigest()
+    uxr_persona_uuid = str(uuid4())
     new_researcher = UXRResearcher(project_uuid=project_uuid, uxr_persona_name=name, uxr_persona_desc=desc, uxr_persona_uuid=uxr_persona_uuid)
     db.add(new_researcher)
     db.commit()
