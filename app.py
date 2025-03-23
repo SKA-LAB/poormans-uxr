@@ -26,6 +26,7 @@ from uxr_app.database import (
     update_persona,
     update_persona_archetype,
     update_uxr_researcher,
+    get_existing_persona_names,
     Persona,
     UXRResearcher,
     Project,
@@ -40,6 +41,9 @@ from datetime import datetime
 import uuid
 import re
 
+# Set page configuration to wide mode
+st.set_page_config(layout="wide")
+
 # Initialize the database
 init_db()
 
@@ -48,8 +52,6 @@ if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['user_id'] = None
     st.session_state['current_project_uuid'] = None
-    st.session_state['interview_queue'] = []  # (persona_uuid, uxr_persona_uuid)
-    st.session_state['interview_status'] = {}  # interview_uuid: status
     st.session_state['guest_mode'] = False  # New: track if user is in guest mode
     st.session_state['guest_user_id'] = None  # New: temporary user ID for guests
     st.session_state['guest_projects'] = []  # New: track projects created as guest
@@ -205,7 +207,7 @@ def create_project_page():
         with st.spinner("Creating project... Please wait."):
             # LLM generated project name.
             prompt = f"""
-            Generate a concise project name based on:
+            Generate a concise and modern project name based on:
             User group: {user_group_desc}
             Product Type: {product_desc}
             Respond only with the project name. 
@@ -239,6 +241,7 @@ def project_main_page(project_uuid):
     if new_project_name != project.project_name:
         project.project_name = new_project_name
         update_project(db, project_uuid, {'project_name':new_project_name})
+        st.rerun()
 
 
     st.write(f"**User Group:** {project.user_group_desc}")
@@ -247,6 +250,7 @@ def project_main_page(project_uuid):
     # --- Persona Archetypes ---
     st.header("Persona Archetypes")
     if st.button("Generate Persona Archetypes"):
+        st.write("Create persona archetypes based on user group and product description.")
         with st.spinner("Generating persona archetypes... This might take a few moments."):
             prompt = f"""
             Generate 7 persona archetypes based on:
@@ -306,7 +310,9 @@ def project_main_page(project_uuid):
     # --- Specific Personas ---
     st.header("Specific Personas")
     if st.button("Generate Personas"):
+        st.write("Create specific personas based on archetypes.")
         archetypes = get_archetypes_by_project(db, project_uuid)
+        existing_names = get_existing_persona_names(db, project_uuid)
         with st.spinner("Generating specific personas for each archetype... This will take a few moments, please do not navigate away..."):
             for archetype in archetypes:
                 prompt = f"""
@@ -314,7 +320,8 @@ def project_main_page(project_uuid):
                 {archetype.persona_archetype_name}: {archetype.persona_archetype_desc}
 
                 Create a clear, complete, and well-structured description of the persona with the following sections:
-                - Name: [Name of the persona].
+                - Name: [Unique name of the persona. Ensure this name is not used for any other persona in this project. 
+                     Existing persona names: {', '.join(existing_names)}].
                 - Age: [Age of the persona].
                 - Demographics: [Demographics of the persona (e.g., gender, race, ethnicity)].
                 - Location: [The location of the persona].
@@ -336,18 +343,37 @@ def project_main_page(project_uuid):
                     name = name.replace("Name:", "").strip().replace("*", "").strip()
                     desc = "Age:" + desc.strip().replace("*", "").strip()
                     create_persona(db, project_uuid, archetype.persona_arch_uuid, name, desc)
+                    existing_names.append(name)
                 except ValueError:
                     st.error(f"Error parsing persona from response: {response}")
         st.rerun()
     #Display, edit, add personas.
     personas = get_personas_by_project(db, project_uuid)
     for persona in personas:
-        with st.expander(persona.persona_name, expanded = True):
+        archetype = db.query(PersonaArchetype).filter(PersonaArchetype.persona_arch_uuid == persona.persona_arch_uuids).first()
+        with st.expander(f"{persona.persona_name} (Archetype: {archetype.persona_archetype_name})", expanded=True):
             new_name = st.text_input("Name", persona.persona_name, key=f"pname_{persona.persona_uuid}")
             new_desc = st.text_area("Description\n", persona.persona_desc, key=f"pdesc_{persona.persona_uuid}")
+            st.info(f"Associated Archetype: {archetype.persona_archetype_name}")
+            st.text(archetype.persona_archetype_desc)
             if new_name != persona.persona_name or new_desc != persona.persona_desc:
                 update_persona(db, persona.persona_uuid, {'persona_name': new_name, 'persona_desc': new_desc})
 
+    # Add new persona manually
+    with st.expander("Add New Persona"):
+        new_persona_name = st.text_input("New Persona Name")
+        new_persona_desc = st.text_area("New Persona Description")
+        archetype_options = {arch.persona_archetype_name: arch.persona_arch_uuid for arch in get_archetypes_by_project(db, project_uuid)}
+        selected_archetype = st.selectbox("Select Associated Archetype", list(archetype_options.keys()))
+        if st.button("Add Persona"):
+            if new_persona_name and new_persona_desc and selected_archetype:
+                create_persona(db, project_uuid, archetype_options[selected_archetype], new_persona_name, new_persona_desc)
+                st.success(f"New persona '{new_persona_name}' added successfully!")
+                st.rerun()
+            else:
+                st.error("Please fill in all fields to add a new persona.")
+
+    
     # --- UXR Researcher Persona ---
     st.header("UX Researcher Persona")
     name, desc = get_researcher_persona()
@@ -361,28 +387,88 @@ def project_main_page(project_uuid):
           if new_name != researcher.uxr_persona_name or new_desc != researcher.uxr_persona_desc:
               update_uxr_researcher(db, researcher.uxr_persona_uuid, {'uxr_persona_name': new_name, 'uxr_persona_desc': new_desc})
 
-    # --- Simulate Interviews ---
+        # --- Simulate Interviews ---
     st.header("Simulate Interviews")
-    if st.button("Run Interviews"):
-        personas = get_personas_by_project(db, project_uuid)
-        researcher = get_uxr_researcher_by_project(db, project_uuid)
-        if researcher:  # Check if researcher exists
-            for persona in personas:
-                st.session_state['interview_queue'].append((persona.persona_uuid, researcher.uxr_persona_uuid))
-        else:
-             st.error("Please generate the UXR Researcher Persona first.")
-    #Process interviews
-    with st.spinner("Running interviews... This will take a few minutes, feel free to get a coffee but do NOT close this page or you will lose the interviews."):
-        if st.session_state['interview_queue']:
-            persona_uuid, uxr_persona_uuid = st.session_state['interview_queue'].pop(0) #get the oldest one.
-            run_interview_simulation(persona_uuid, uxr_persona_uuid, project_uuid) #this also updates the session state.
-    #Display interviews
-    interviews = get_interviews_by_project(db, project_uuid)
-    for interview in interviews:
-        persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
-        status = st.session_state['interview_status'].get(interview.interview_uuid,"Unknown")
-        with st.expander(f"Interview with {persona.persona_name} ({status})"):
-            display_interview(interview.interview_transcript)
+    
+    personas = get_personas_by_project(db, project_uuid)
+    researcher = get_uxr_researcher_by_project(db, project_uuid)
+    
+    if not researcher:
+        st.error("Please generate the UXR Researcher Persona first.")
+    elif not personas:
+        st.error("Please generate Specific Personas first.")
+    else:
+        # Create a dictionary to store interview status
+        if 'interview_status' not in st.session_state:
+            st.session_state['interview_status'] = {}
+
+        # Display interview status and buttons
+        for persona in personas:
+            interview = db.query(Interview).filter(
+                Interview.persona_uuid == persona.persona_uuid,
+                Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
+                Interview.project_uuid == project_uuid
+            ).first()
+
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                if interview:
+                    st.info(f"Interview with {persona.persona_name} (Completed)")
+                elif persona.persona_uuid in st.session_state['interview_status']:
+                    if st.session_state['interview_status'][persona.persona_uuid] == "in_progress":
+                        st.warning(f"Interview with {persona.persona_name} in progress...")
+                    elif st.session_state['interview_status'][persona.persona_uuid] == "error":
+                        st.error(f"Error occurred while interviewing {persona.persona_name}")
+                else:
+                    st.text(f"Interview with {persona.persona_name} not started")
+
+            with col2:
+                button_key = f"interview_button_{persona.persona_uuid}"
+                if interview:
+                    st.button("View", key=button_key, on_click=lambda: st.session_state.update({'selected_interview': interview.interview_uuid}))
+                elif persona.persona_uuid not in st.session_state['interview_status'] or st.session_state['interview_status'][persona.persona_uuid] == "error":
+                    if st.button("Run", key=button_key):
+                        st.session_state['interview_status'][persona.persona_uuid] = "in_progress"
+                        try:
+                            with st.spinner(f"Running interview with {persona.persona_name}... This will take a few minutes."):
+                                run_interview_simulation(persona.persona_uuid, researcher.uxr_persona_uuid, project_uuid)
+                            st.session_state['interview_status'][persona.persona_uuid] = "completed"
+                            st.success(f"Interview with {persona.persona_name} completed!")
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state['interview_status'][persona.persona_uuid] = "error"
+                            st.error(f"An error occurred: {str(e)}")
+
+        # Run all interviews button
+        if st.button("Run All Remaining Interviews"):
+            remaining_personas = [p for p in personas if not db.query(Interview).filter(
+                Interview.persona_uuid == p.persona_uuid,
+                Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
+                Interview.project_uuid == project_uuid
+            ).first()]
+
+            for persona in remaining_personas:
+                st.session_state['interview_status'][persona.persona_uuid] = "in_progress"
+                try:
+                    with st.spinner(f"Running interview with {persona.persona_name}... This will take a few minutes."):
+                        run_interview_simulation(persona.persona_uuid, researcher.uxr_persona_uuid, project_uuid)
+                    st.session_state['interview_status'][persona.persona_uuid] = "completed"
+                    st.success(f"Interview with {persona.persona_name} completed!")
+                except Exception as e:
+                    st.session_state['interview_status'][persona.persona_uuid] = "error"
+                    st.error(f"An error occurred while interviewing {persona.persona_name}: {str(e)}")
+            
+            st.rerun()
+
+        # Display interviews
+        if 'selected_interview' in st.session_state:
+            interview = db.query(Interview).filter(Interview.interview_uuid == st.session_state['selected_interview']).first()
+            if interview:
+                persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
+                with st.expander(f"Interview with {persona.persona_name}", expanded=True):
+                    display_interview(interview.interview_transcript)
+            del st.session_state['selected_interview']
 
     # --- Analyze Interviews ---
     st.header("Analyze Interviews")

@@ -191,6 +191,7 @@ def update_persona(db, persona_uuid, update_data):
         db.commit()
         db.refresh(persona)
     return persona
+
 def update_uxr_researcher(db, uxr_persona_uuid, update_data):
     researcher = db.query(UXRResearcher).filter(UXRResearcher.uxr_persona_uuid == uxr_persona_uuid).first()
     if researcher:
@@ -198,3 +199,7 @@ def update_uxr_researcher(db, uxr_persona_uuid, update_data):
             setattr(researcher, key, value)
         db.commit()
         db.refresh(researcher)
+
+def get_existing_persona_names(db, project_uuid):
+    personas = get_personas_by_project(db, project_uuid)
+    return [persona.persona_name for persona in personas]
