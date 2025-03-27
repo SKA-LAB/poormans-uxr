@@ -203,3 +203,17 @@ def update_uxr_researcher(db, uxr_persona_uuid, update_data):
 def get_existing_persona_names(db, project_uuid):
     personas = get_personas_by_project(db, project_uuid)
     return [persona.persona_name for persona in personas]
+
+
+class DatabaseManager:
+    def __init__(self, db_session):
+        self.db = db_session
+
+    def get_user_by_email(self, email):
+        return self.db.query(User).filter(User.email == email).first()
+
+    def create_user(self, email, password):
+        user = User(email=email, password=password)
+        self.db.add(user)
+        self.db.commit()
+        return user
