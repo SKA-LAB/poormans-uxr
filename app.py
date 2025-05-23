@@ -33,6 +33,17 @@ from uxr_app.database import (
     Interview,
     PersonaArchetype,
 )
+from utils.prompt_templates import (
+    get_project_name_prompt,
+    get_persona_archetypes_prompt,
+    get_specific_persona_prompt,
+    parse_persona_response,
+    get_exec_summary_prompt,
+    get_recommendations_prompt,
+    get_findings_prompt,
+    get_demographics_prompt
+)
+from uxr_app.auth import (logout_user)
 import json
 from utils.interview_utils import get_researcher_persona, simulate_interview
 from utils.convo_analysis import call_llm, cluster_sentences, summarize_each_cluster
@@ -40,6 +51,35 @@ import time
 from datetime import datetime
 import uuid
 import re
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+def initialize_session_state():
+    """Initialize all session state variables if they don't exist."""
+    if 'logged_in' not in st.session_state:
+        st.session_state['logged_in'] = False
+        st.session_state['user_id'] = None
+        st.session_state['current_project_uuid'] = None
+        st.session_state['guest_mode'] = False
+        st.session_state['guest_user_id'] = None
+        st.session_state['guest_projects'] = []
+
+def reset_session_state():
+    """Reset all session state variables on logout."""
+    st.session_state['logged_in'] = False
+    st.session_state['user_id'] = None
+    st.session_state['current_project_uuid'] = None
+    st.session_state['guest_mode'] = False
+    st.session_state['guest_user_id'] = None
+    
+    # Clear analysis-related state
+    if 'interview_status' in st.session_state:
+        del st.session_state['interview_status']
+    if 'cluster_summaries' in st.session_state:
+        del st.session_state['cluster_summaries']
+    if 'uxr_report' in st.session_state:
+        del st.session_state['uxr_report']
 
 # Set page configuration to wide mode
 st.set_page_config(layout="wide")
@@ -48,13 +88,7 @@ st.set_page_config(layout="wide")
 init_db()
 
 # --- Session State Management ---
-if 'logged_in' not in st.session_state:
-    st.session_state['logged_in'] = False
-    st.session_state['user_id'] = None
-    st.session_state['current_project_uuid'] = None
-    st.session_state['guest_mode'] = False  # New: track if user is in guest mode
-    st.session_state['guest_user_id'] = None  # New: temporary user ID for guests
-    st.session_state['guest_projects'] = []  # New: track projects created as guest
+initialize_session_state()
 
 # Add a function to handle guest user creation
 def create_guest_user():
@@ -78,11 +112,45 @@ def run_interview_simulation(persona_uuid, uxr_persona_uuid, project_uuid):
     transcript = simulate_interview(uxr_persona.uxr_persona_name, uxr_persona.uxr_persona_desc, 
                                       persona.persona_name, persona.persona_desc, 
                                       st.session_state.product_desc,
-                                      st.secrets["api_key"])
+                                      st.secrets["api_key"],
+                                      model_name=st.secrets["model_name"])
 
     create_interview(db, persona_uuid, uxr_persona_uuid, project_uuid, json.dumps(transcript))
     st.session_state['interview_status'][interview_uuid] = "complete"
     db.close()
+
+def run_interview_in_background(persona_uuid, uxr_persona_uuid, project_uuid):
+    """Runs an interview simulation in a background thread and updates the session state."""
+    try:
+        db = next(get_db())
+        persona = db.query(Persona).filter(Persona.persona_uuid == persona_uuid).first()
+        uxr_persona = db.query(UXRResearcher).filter(UXRResearcher.uxr_persona_uuid == uxr_persona_uuid).first()
+        project = db.query(Project).filter(Project.project_uuid == project_uuid).first()
+        
+        # Update status to in_progress
+        st.session_state['interview_status'][persona_uuid] = "in_progress"
+        
+        # Run the interview simulation
+        transcript = simulate_interview(
+            uxr_persona.uxr_persona_name, 
+            uxr_persona.uxr_persona_desc, 
+            persona.persona_name, 
+            persona.persona_desc, 
+            project.product_desc,
+            st.secrets["api_key"],
+            model_name=st.secrets["model_name"]
+        )
+        
+        # Save the interview to the database
+        create_interview(db, persona_uuid, uxr_persona_uuid, project_uuid, json.dumps(transcript))
+        
+        # Update status to completed
+        st.session_state['interview_status'][persona_uuid] = "completed"
+        db.close()
+    except Exception as e:
+        # Update status to error
+        st.session_state['interview_status'][persona_uuid] = "error"
+        st.session_state['interview_errors'][persona_uuid] = str(e)
 
 # --- Helper function for displaying interviews ---
 def display_interview(interview_transcript: str):
@@ -206,15 +274,8 @@ def create_project_page():
 
         with st.spinner("Creating project... Please wait."):
             # LLM generated project name.
-            prompt = f"""
-            Generate a concise and modern project name based on:
-            User group: {user_group_desc}
-            Product Type: {product_desc}
-            Respond only with the project name. 
-
-            Project name:
-            """
-            project_name = call_llm(prompt, st.secrets["api_key"])
+            prompt = get_project_name_prompt(user_group_desc, product_desc)
+            project_name = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
         project = create_project(db, st.session_state['user_id'], user_group_desc, product_desc, project_name)
         st.session_state['current_project_uuid'] = project.project_uuid
         st.session_state['project_name'] = project.project_name
@@ -230,6 +291,121 @@ def create_project_page():
         db.close()
         st.success(f"Project '{project_name}' created!")
         st.rerun()
+
+def generate_uxr_report(project, personas, interviews, cluster_summaries, report_options, api_key, model_name):
+    """
+    Generate a UX research report based on the provided data and selected sections.
+    
+    Args:
+        project: The project object containing project details
+        personas: List of persona objects
+        interviews: List of interview objects
+        cluster_summaries: Dictionary of cluster summaries
+        report_options: Dictionary with boolean flags for which sections to include and report title
+        api_key: API key for LLM calls
+        
+    Returns:
+        dict: The generated report content by section
+        str: The compiled full report
+    """
+    report_content = {}
+    
+    # Executive Summary
+    if report_options.get('include_exec_summary', False):
+        themes = [summary['theme'] for _, summary in cluster_summaries.items()]
+        exec_summary_prompt = get_exec_summary_prompt(project.product_desc, 
+                                                    project.user_group_desc,
+                                                    themes)
+        report_content['executive_summary'] = call_llm(exec_summary_prompt, api_key, model_name)
+    
+    # Research Background
+    if report_options.get('include_background', False):
+        report_content['research_background'] = f"""
+        ## Research Background
+        
+        **Project:** {project.project_name}
+        
+        **Product Description:** {project.product_desc}
+        
+        **Target User Group:** {project.user_group_desc}
+        
+        **Research Methodology:** This research was conducted using simulated interviews with AI-generated personas 
+        representing the target user group. The interviews were designed to explore user needs, pain points, 
+        and potential value propositions related to the product. Since personas were AI-generated, there may be 
+        biases and caveats to the research. Please use these results as directional guidance for product development
+        and validate all findings with customer interviews and product stakeholders.
+        
+        **Research Period:** {datetime.now().strftime("%B %Y")}
+        """
+    
+    # Participant Demographics
+    if report_options.get('include_demographics', False):
+        demographics_text = "## Participant Demographics\n\n"
+        for i, persona in enumerate(personas, 1):
+            demographics_text += f"### Participant {i}: {persona.persona_name}\n\n"
+            
+            # Extract key demographic information from persona description
+            demo_prompt = get_demographics_prompt(persona.persona_desc)
+            demo_summary = call_llm(demo_prompt, api_key, model_name)
+            demographics_text += f"{demo_summary}\n\n"
+        
+        report_content['demographics'] = demographics_text
+    
+    # Key Findings
+    if report_options.get('include_key_findings', False):
+        findings_prompt = get_findings_prompt(json.dumps([summary for _, summary in cluster_summaries.items()]))
+        report_content['key_findings'] = "## Key Findings\n\n" + call_llm(findings_prompt, api_key, model_name)
+    
+    # Detailed Analysis
+    if report_options.get('include_detailed_analysis', False):
+        detailed_analysis = "## Detailed Analysis\n\n"
+        for i, (_, summary) in enumerate(cluster_summaries.items(), 1):
+            detailed_analysis += f"### Theme {i}: {summary['theme']}\n\n"
+            detailed_analysis += f"{summary['description']}\n\n"
+            detailed_analysis += "**Supporting Evidence:**\n\n"
+            detailed_analysis += f"{summary['sample_sentences']}\n\n"
+        
+        report_content['detailed_analysis'] = detailed_analysis
+    
+    # Recommendations
+    if report_options.get('include_recommendations', False):
+        recommendations_prompt = get_recommendations_prompt(
+            project.product_desc,
+            project.user_group_desc,
+            json.dumps([summary for _, summary in cluster_summaries.items()])
+        )
+        report_content['recommendations'] = "## Recommendations\n\n" + call_llm(recommendations_prompt, api_key, model_name)
+    
+    # Appendix
+    if report_options.get('include_appendix', False):
+        appendix = "## Appendix: Raw Interview Data\n\n"
+        for i, interview in enumerate(interviews, 1):
+            persona = next((p for p in personas if p.persona_uuid == interview.persona_uuid), None)
+            if persona:
+                appendix += f"### Interview {i}: Conversation with {persona.persona_name}\n\n"
+                
+                conversation = json.loads(interview.interview_transcript)
+                for j, turn in enumerate(conversation, 1):
+                    appendix += f"**Researcher:** {turn['researcher']}\n\n"
+                    appendix += f"**{persona.persona_name}:** {turn['user']}\n\n"
+                
+                appendix += "---\n\n"
+        
+        report_content['appendix'] = appendix
+    
+    # Compile full report
+    full_report = f"# {report_options.get('report_title', 'UXR Report')}\n\n"
+    
+    if report_options.get('include_exec_summary', False):
+        full_report += "## Executive Summary\n\n"
+        full_report += report_content['executive_summary'] + "\n\n"
+    
+    for section in ['research_background', 'demographics', 'key_findings', 
+                'detailed_analysis', 'recommendations', 'appendix']:
+        if section in report_content:
+            full_report += report_content[section] + "\n\n"
+    
+    return report_content, full_report
 
 def project_main_page(project_uuid):
     db = next(get_db())
@@ -252,25 +428,8 @@ def project_main_page(project_uuid):
     if st.button("Generate Persona Archetypes"):
         st.write("Create persona archetypes based on user group and product description.")
         with st.spinner("Generating persona archetypes... This might take a few moments."):
-            prompt = f"""
-            Generate 7 persona archetypes based on:
-            User group: {project.user_group_desc}
-            Product: {project.product_desc}
-            Persona archetypes are not specific personas but categories of user personas that are distinct from each other and can be used as
-            building blocks for creating specific personas.
-
-            Format your output as:
-            <archetype-1>
-            Name: [Archetype name]
-            Description: [Archetype description]
-            </archetype-1>
-            ...
-            <archetype-7>
-            Name: [Archetype name]
-            Description: [Archetype description]
-            </archetype-7>
-            """
-            response = call_llm(prompt, st.secrets["api_key"])
+            prompt = get_persona_archetypes_prompt(project.user_group_desc, project.product_desc)
+            response = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
         archetypes_data = response.split("<archetype-")
         db = next(get_db()) #re-establish since call_llm closes it.
         for archetype_str in archetypes_data:
@@ -315,33 +474,15 @@ def project_main_page(project_uuid):
         existing_names = get_existing_persona_names(db, project_uuid)
         with st.spinner("Generating specific personas for each archetype... This will take a few moments, please do not navigate away..."):
             for archetype in archetypes:
-                prompt = f"""
-                Generate a specific user persona based on this archetype:
-                {archetype.persona_archetype_name}: {archetype.persona_archetype_desc}
-
-                Create a clear, complete, and well-structured description of the persona with the following sections:
-                - Name: [Unique name of the persona. Ensure this name is not used for any other persona in this project. 
-                     Existing persona names: {', '.join(existing_names)}].
-                - Age: [Age of the persona].
-                - Demographics: [Demographics of the persona (e.g., gender, race, ethnicity)].
-                - Location: [The location of the persona].
-                - Motivations: [The motivations of the persona].
-                - Goals and needs: [The goals and needs of the persona].
-                - Values: [The values and aspirations of the persona].
-                - Attitudes and beliefs: [The attitudes and beliefs of the persona].
-                - Lifestyle: [The lifestyle of the persona].
-                - Daily routine: [The daily routine of the persona].
-                - Devise usage: [The usage of technology by the persona].
-                - Software familiarity: [Their level of comfort with specific software or platforms]
-                - Digital literacy: [Confidence in navigating digital platforms and software]
-                - Pain points: [The pain points and concerns of the persona].
-                - Delightful moments: [The moments and experiences that bring the persona joy and satisfaction].
-                """
-                response = call_llm(prompt, st.secrets["api_key"])
+                prompt = get_specific_persona_prompt(archetype.persona_archetype_name, 
+                                                     archetype.persona_archetype_desc,
+                                                     existing_names,
+                                                     project.product_desc)
+                response = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
                 try:
-                    name, desc = response.split("Age:", 1)
-                    name = name.replace("Name:", "").strip().replace("*", "").strip()
-                    desc = "Age:" + desc.strip().replace("*", "").strip()
+                    persona_dict = parse_persona_response(response)
+                    name = persona_dict['name']
+                    desc = persona_dict['description']
                     create_persona(db, project_uuid, archetype.persona_arch_uuid, name, desc)
                     existing_names.append(name)
                 except ValueError:
@@ -398,9 +539,30 @@ def project_main_page(project_uuid):
     elif not personas:
         st.error("Please generate Specific Personas first.")
     else:
-        # Create a dictionary to store interview status
+        # Create dictionaries to store interview status and errors
         if 'interview_status' not in st.session_state:
             st.session_state['interview_status'] = {}
+        if 'interview_errors' not in st.session_state:
+            st.session_state['interview_errors'] = {}
+
+        # Check for completed interviews that need to be refreshed in UI
+        needs_rerun = False
+        for persona_uuid, status in st.session_state['interview_status'].items():
+            if status == "completed":
+                # Check if the interview exists in the database
+                interview = db.query(Interview).filter(
+                    Interview.persona_uuid == persona_uuid,
+                    Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
+                    Interview.project_uuid == project_uuid
+                ).first()
+                if interview:
+                    # Mark for rerun to update UI
+                    needs_rerun = True
+                    # Reset status after confirming it's in the database
+                    st.session_state['interview_status'][persona_uuid] = "viewed"
+        
+        if needs_rerun:
+            st.rerun()
 
         # Display interview status and buttons
         for persona in personas:
@@ -419,26 +581,27 @@ def project_main_page(project_uuid):
                     if st.session_state['interview_status'][persona.persona_uuid] == "in_progress":
                         st.warning(f"Interview with {persona.persona_name} in progress...")
                     elif st.session_state['interview_status'][persona.persona_uuid] == "error":
-                        st.error(f"Error occurred while interviewing {persona.persona_name}")
+                        error_msg = st.session_state['interview_errors'].get(persona.persona_uuid, "Unknown error")
+                        st.error(f"Error occurred while interviewing {persona.persona_name}: {error_msg}")
                 else:
                     st.text(f"Interview with {persona.persona_name} not started")
 
             with col2:
                 button_key = f"interview_button_{persona.persona_uuid}"
                 if interview:
-                    st.button("View", key=button_key, on_click=lambda: st.session_state.update({'selected_interview': interview.interview_uuid}))
+                    if st.button("View", key=button_key):
+                        st.session_state['selected_interview'] = interview.interview_uuid
+                        st.rerun()
                 elif persona.persona_uuid not in st.session_state['interview_status'] or st.session_state['interview_status'][persona.persona_uuid] == "error":
                     if st.button("Run", key=button_key):
-                        st.session_state['interview_status'][persona.persona_uuid] = "in_progress"
-                        try:
-                            with st.spinner(f"Running interview with {persona.persona_name}... This will take a few minutes."):
-                                run_interview_simulation(persona.persona_uuid, researcher.uxr_persona_uuid, project_uuid)
-                            st.session_state['interview_status'][persona.persona_uuid] = "completed"
-                            st.success(f"Interview with {persona.persona_name} completed!")
-                            st.rerun()
-                        except Exception as e:
-                            st.session_state['interview_status'][persona.persona_uuid] = "error"
-                            st.error(f"An error occurred: {str(e)}")
+                        # Start interview in background thread
+                        thread = threading.Thread(
+                            target=run_interview_in_background,
+                            args=(persona.persona_uuid, researcher.uxr_persona_uuid, project_uuid)
+                        )
+                        thread.daemon = True
+                        thread.start()
+                        st.rerun()
 
         # Run all interviews button
         if st.button("Run All Remaining Interviews"):
@@ -448,18 +611,18 @@ def project_main_page(project_uuid):
                 Interview.project_uuid == project_uuid
             ).first()]
 
-            for persona in remaining_personas:
-                st.session_state['interview_status'][persona.persona_uuid] = "in_progress"
-                try:
-                    with st.spinner(f"Running interview with {persona.persona_name}... This will take a few minutes."):
-                        run_interview_simulation(persona.persona_uuid, researcher.uxr_persona_uuid, project_uuid)
-                    st.session_state['interview_status'][persona.persona_uuid] = "completed"
-                    st.success(f"Interview with {persona.persona_name} completed!")
-                except Exception as e:
-                    st.session_state['interview_status'][persona.persona_uuid] = "error"
-                    st.error(f"An error occurred while interviewing {persona.persona_name}: {str(e)}")
+            # Create a thread pool to run interviews concurrently
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                for persona in remaining_personas:
+                    executor.submit(
+                        run_interview_in_background,
+                        persona.persona_uuid,
+                        researcher.uxr_persona_uuid,
+                        project_uuid
+                    )
             
-            st.rerun()
+            if remaining_personas:
+                st.rerun()
 
         # Display interviews
         if 'selected_interview' in st.session_state:
@@ -468,7 +631,6 @@ def project_main_page(project_uuid):
                 persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
                 with st.expander(f"Interview with {persona.persona_name}", expanded=True):
                     display_interview(interview.interview_transcript)
-            del st.session_state['selected_interview']
 
     # --- Analyze Interviews ---
     st.header("Analyze Interviews")
@@ -478,10 +640,12 @@ def project_main_page(project_uuid):
             all_conversations = []
             for interview in interviews:
                 all_conversations.extend(json.loads(interview.interview_transcript)) 
-            clusters = cluster_sentences(all_conversations, st.secrets["api_key"])
+            clusters = cluster_sentences(all_conversations, st.secrets["api_key"], 
+                                        st.secrets["model_name"])
             cluster_summaries = summarize_each_cluster(clusters, st.session_state.product_desc, 
                                                     st.session_state.user_group_desc,
-                                                    st.secrets["api_key"])
+                                                    st.secrets["api_key"],
+                                                    st.secrets["model_name"])
             st.session_state['cluster_summaries'] = cluster_summaries
         for _, summary in cluster_summaries.items():
             with st.expander(f"Theme: {summary['theme']}"):
@@ -519,139 +683,28 @@ def project_main_page(project_uuid):
                         interviews = get_interviews_by_project(db, project_uuid)
                         cluster_summaries = st.session_state['cluster_summaries']
                         
-                        # Generate report content
-                        report_content = {}
+                        # Configure report options
+                        report_options = {
+                            'report_title': report_title,
+                            'include_exec_summary': include_exec_summary,
+                            'include_background': include_background,
+                            'include_demographics': include_demographics,
+                            'include_key_findings': include_key_findings,
+                            'include_detailed_analysis': include_detailed_analysis,
+                            'include_recommendations': include_recommendations,
+                            'include_appendix': include_appendix
+                        }
                         
-                        # Executive Summary
-                        if include_exec_summary:
-                            exec_summary_prompt = f"""
-                            Create an executive summary for a UX research report based on the following:
-                            
-                            Product: {project.product_desc}
-                            User Group: {project.user_group_desc}
-                            Key Themes: {', '.join([summary['theme'] for _, summary in cluster_summaries.items()])}
-                            
-                            The executive summary should be concise (150-250 words) and highlight the most important findings
-                            and recommendations. Focus on insights that would be most valuable for product development.
-                            """
-                            report_content['executive_summary'] = call_llm(exec_summary_prompt, st.secrets["api_key"])
-                        
-                        # Research Background
-                        if include_background:
-                            report_content['research_background'] = f"""
-                            ## Research Background
-                            
-                            **Project:** {project.project_name}
-                            
-                            **Product Description:** {project.product_desc}
-                            
-                            **Target User Group:** {project.user_group_desc}
-                            
-                            **Research Methodology:** This research was conducted using simulated interviews with AI-generated personas 
-                            representing the target user group. The interviews were designed to explore user needs, pain points, 
-                            and potential value propositions related to the product. Since personas were AI-generated, there may be 
-                            biases and caveats to the research. Please use these results as directional guidance for product development
-                            and validate all findings with customer interviews and product stakeholders.
-                            
-                            **Research Period:** {datetime.now().strftime("%B %Y")}
-                            """
-                        
-                        # Participant Demographics
-                        if include_demographics:
-                            demographics_text = "## Participant Demographics\n\n"
-                            for i, persona in enumerate(personas, 1):
-                                demographics_text += f"### Participant {i}: {persona.persona_name}\n\n"
-                                
-                                # Extract key demographic information from persona description
-                                demo_prompt = f"""
-                                Extract and summarize the key demographic information from this persona description in 3-4 sentences:
-                                
-                                {persona.persona_desc}
-                                
-                                Focus only on demographics, age, location, and background. Be concise.
-                                """
-                                demo_summary = call_llm(demo_prompt, st.secrets["api_key"])
-                                demographics_text += f"{demo_summary}\n\n"
-                            
-                            report_content['demographics'] = demographics_text
-                        
-                        # Key Findings
-                        if include_key_findings:
-                            findings_prompt = f"""
-                            Create a "Key Findings" section for a UX research report based on these themes:
-                            
-                            {json.dumps([summary for _, summary in cluster_summaries.items()])}
-                            
-                            For each theme, provide:
-                            1. A clear headline that captures the essence of the finding
-                            2. A brief explanation (2-3 sentences)
-                            3. The potential impact on the product design
-                            
-                            Format each finding as a separate section with markdown formatting.
-                            """
-                            report_content['key_findings'] = "## Key Findings\n\n" + call_llm(findings_prompt, st.secrets["api_key"])
-                        
-                        # Detailed Analysis
-                        if include_detailed_analysis:
-                            detailed_analysis = "## Detailed Analysis\n\n"
-                            for i, (_, summary) in enumerate(cluster_summaries.items(), 1):
-                                detailed_analysis += f"### Theme {i}: {summary['theme']}\n\n"
-                                detailed_analysis += f"{summary['description']}\n\n"
-                                detailed_analysis += "**Supporting Evidence:**\n\n"
-                                detailed_analysis += f"{summary['sample_sentences']}\n\n"
-                            
-                            report_content['detailed_analysis'] = detailed_analysis
-                        
-                        # Recommendations
-                        if include_recommendations:
-                            recommendations_prompt = f"""
-                            Create a "Recommendations" section for a UX research report based on these research findings:
-                            
-                            Product: {project.product_desc}
-                            User Group: {project.user_group_desc}
-                            Key Themes: {json.dumps([summary for _, summary in cluster_summaries.items()])}
-                            
-                            Provide 5-7 specific, actionable recommendations that:
-                            1. Address the key pain points identified
-                            2. Leverage the opportunities discovered
-                            3. Are realistic to implement
-                            
-                            Format each recommendation with:
-                            - A clear, actionable title
-                            - A brief explanation of the recommendation
-                            - The expected impact or benefit
-                            
-                            Use markdown formatting.
-                            """
-                            report_content['recommendations'] = "## Recommendations\n\n" + call_llm(recommendations_prompt, st.secrets["api_key"])
-                        
-                        # Appendix
-                        if include_appendix:
-                            appendix = "## Appendix: Raw Interview Data\n\n"
-                            for i, interview in enumerate(interviews, 1):
-                                persona = db.query(Persona).filter(Persona.persona_uuid == interview.persona_uuid).first()
-                                appendix += f"### Interview {i}: Conversation with {persona.persona_name}\n\n"
-                                
-                                conversation = json.loads(interview.interview_transcript)
-                                for j, turn in enumerate(conversation, 1):
-                                    appendix += f"**Researcher:** {turn['researcher']}\n\n"
-                                    appendix += f"**{persona.persona_name}:** {turn['user']}\n\n"
-                                
-                                appendix += "---\n\n"
-                            
-                            report_content['appendix'] = appendix
-                        
-                        # Compile full report
-                        full_report = f"# {report_title}\n\n"
-                        
-                        if include_exec_summary:
-                            full_report += "## Executive Summary\n\n"
-                            full_report += report_content['executive_summary'] + "\n\n"
-                        
-                        for section in ['research_background', 'demographics', 'key_findings', 
-                                    'detailed_analysis', 'recommendations', 'appendix']:
-                            if section in report_content:
-                                full_report += report_content[section] + "\n\n"
+                        # Generate the report
+                        _, full_report = generate_uxr_report(
+                            project, 
+                            personas, 
+                            interviews, 
+                            cluster_summaries, 
+                            report_options, 
+                            st.secrets["api_key"],
+                            st.secrets["model_name"]
+                        )
                         
                         # Store the report in session state
                         st.session_state['uxr_report'] = full_report
@@ -785,11 +838,8 @@ else:
         st.sidebar.write(f"Logged in as: {st.session_state['user_id']}")
 
     if st.sidebar.button("Logout"):
-        st.session_state['logged_in'] = False
-        st.session_state['user_id'] = None
-        st.session_state['current_project_uuid'] = None
-        st.session_state['guest_mode'] = False
-        st.session_state['guest_user_id'] = None
+        logout_user()
+        reset_session_state()
         st.rerun()
 
     if st.session_state['current_project_uuid'] is None:

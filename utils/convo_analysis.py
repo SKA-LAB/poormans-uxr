@@ -19,8 +19,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-def call_llm(prompt: str, api_key: str) -> str:
-    llm = get_chat_model(api_key)
+def call_llm(prompt: str, api_key: str, model_name: str) -> str:
+    llm = get_chat_model(api_key, model_name)
     response = llm.invoke(prompt).content
     return response
 
@@ -142,13 +142,13 @@ class ClusterSentences:
 
 
 def summarize_each_cluster(clusters: dict, product_description: str,
-                            user_description: str, api_key: str) -> dict:
+                            user_description: str, api_key: str, model_name: str) -> dict:
     summaries = {}
     for cluster_id, sentences in clusters.items():
         joined_sentences = "\n".join(sentences)
         theme, description, sample_sentences = summarize_sentences(joined_sentences, product_description,
-                                      user_description, api_key)
-        if keep_theme(theme, description, product_description, user_description, api_key):
+                                      user_description, api_key, model_name)
+        if keep_theme(theme, description, product_description, user_description, api_key, model_name):
             summaries[cluster_id] = {
                 "theme": theme,
                 "description": description,
@@ -157,7 +157,7 @@ def summarize_each_cluster(clusters: dict, product_description: str,
     return summaries
     
 def summarize_sentences(sentences: str, product_description: str,
-                        user_description: str, api_key: str) -> str:
+                        user_description: str, api_key: str, model_name: str) -> str:
     prefix = "You are looking at excerpts from transcripts of user interviews.\n"
     if product_description:
         prefix += f"For the following product description: {product_description}\n"
@@ -182,14 +182,14 @@ def summarize_sentences(sentences: str, product_description: str,
     ...
     </sample_sentences>
     """
-    output = call_llm(prompt, api_key)
+    output = call_llm(prompt, api_key, model_name)
     theme = output.split("<theme>")[1].split("</theme>")[0].strip()
     description = output.split("<description>")[1].split("</description>")[0].strip()
     sample_sentences = output.split("<sample_sentences>")[1].split("</sample_sentences>")[0].strip()
     return theme, description, sample_sentences
 
 
-def keep_theme(theme: str, theme_desc: str, product_description: str, user_description: str, api_key: str) -> bool:
+def keep_theme(theme: str, theme_desc: str, product_description: str, user_description: str, api_key: str, model_name: str) -> bool:
     prompt = f"""An automated analysis platform for user research interviews has discovered the following theme 
     and description based on a cluster of sentences from user interviews for a certain product and user group description.
 
@@ -205,6 +205,6 @@ def keep_theme(theme: str, theme_desc: str, product_description: str, user_descr
     is irrelevant. For example, 
     
     <thinking>Your reasoning here...</thinking> TRUE/FALSE """
-    output = call_llm(prompt, api_key)
+    output = call_llm(prompt, api_key, model_name)
     response = output.split("</thinking>")[1].strip()
     return "TRUE" in response.upper()

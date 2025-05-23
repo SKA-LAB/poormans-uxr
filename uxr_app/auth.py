@@ -3,6 +3,19 @@ import uuid
 import re
 from uxr_app.database import get_db, create_user, get_user_by_email, update_project
 
+def is_logged_in():
+    return st.session_state.get('logged_in', False)
+
+def is_guest_mode():
+    return st.session_state.get('guest_mode', False)
+
+def logout_user():
+    st.session_state['logged_in'] = False
+    st.session_state['user_id'] = None
+    st.session_state['current_project_uuid'] = None
+    st.session_state['guest_mode'] = False
+    st.session_state['guest_user_id'] = None
+
 def login_page(db_manager):
     st.title("Login")
     email = st.text_input("Email")
@@ -102,7 +115,3 @@ def transfer_guest_data(state, db_manager, new_user_id):
             project = db_manager.get_project_by_uuid(project_uuid)
             if project:
                 db_manager.update_project(project_uuid, {'user_id': new_user_id})
-
-def logout(state):
-    state.logout()
-    st.rerun()
