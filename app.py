@@ -54,6 +54,19 @@ import re
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Set up logging with script name, line number, and timestamp
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+logger = logging.getLogger(__name__)
+logger.info("Application started")
+
+model_key = "model_name"
 
 def initialize_session_state():
     """Initialize all session state variables if they don't exist."""
@@ -113,44 +126,115 @@ def run_interview_simulation(persona_uuid, uxr_persona_uuid, project_uuid):
                                       persona.persona_name, persona.persona_desc, 
                                       st.session_state.product_desc,
                                       st.secrets["api_key"],
-                                      model_name=st.secrets["model_name"])
+                                      model_name=st.secrets[model_key])
 
     create_interview(db, persona_uuid, uxr_persona_uuid, project_uuid, json.dumps(transcript))
     st.session_state['interview_status'][interview_uuid] = "complete"
     db.close()
 
 def run_interview_in_background(persona_uuid, uxr_persona_uuid, project_uuid):
-    """Runs an interview simulation in a background thread and updates the session state."""
+    """Runs an interview simulation in a background thread and updates the database directly."""
     try:
-        db = next(get_db())
-        persona = db.query(Persona).filter(Persona.persona_uuid == persona_uuid).first()
-        uxr_persona = db.query(UXRResearcher).filter(UXRResearcher.uxr_persona_uuid == uxr_persona_uuid).first()
-        project = db.query(Project).filter(Project.project_uuid == project_uuid).first()
+        # Set up thread-specific logging
+        thread_id = threading.current_thread().name
+        logging.info(f"[{thread_id}] Starting interview for persona UUID: {persona_uuid}")
         
-        # Update status to in_progress
-        st.session_state['interview_status'][persona_uuid] = "in_progress"
+        # Create a new database session for this thread
+        from sqlalchemy.orm import sessionmaker
+        from uxr_app.database import engine
         
-        # Run the interview simulation
-        transcript = simulate_interview(
-            uxr_persona.uxr_persona_name, 
-            uxr_persona.uxr_persona_desc, 
-            persona.persona_name, 
-            persona.persona_desc, 
-            project.product_desc,
-            st.secrets["api_key"],
-            model_name=st.secrets["model_name"]
-        )
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        db = SessionLocal()
         
-        # Save the interview to the database
-        create_interview(db, persona_uuid, uxr_persona_uuid, project_uuid, json.dumps(transcript))
-        
-        # Update status to completed
-        st.session_state['interview_status'][persona_uuid] = "completed"
-        db.close()
+        try:
+            # Get the necessary data
+            persona = db.query(Persona).filter(Persona.persona_uuid == persona_uuid).first()
+            uxr_persona = db.query(UXRResearcher).filter(UXRResearcher.uxr_persona_uuid == uxr_persona_uuid).first()
+            project = db.query(Project).filter(Project.project_uuid == project_uuid).first()
+            
+            if not persona or not uxr_persona or not project:
+                logging.error(f"[{thread_id}] Could not find required data: persona={bool(persona)}, uxr_persona={bool(uxr_persona)}, project={bool(project)}")
+                return
+            
+            logging.info(f"[{thread_id}] Retrieved data for persona: {persona.persona_name}")
+            
+            # Run the interview simulation
+            logging.info(f"[{thread_id}] Starting interview simulation for persona: {persona.persona_name}")
+            
+            # Import secrets directly in this thread
+            import json
+            from utils.interview_utils import simulate_interview
+            
+            # Get API key and model name from secrets.toml
+            import toml
+            import os
+            
+            # Determine the path to secrets.toml
+            secrets_path = os.path.join(os.path.dirname(__file__), '.streamlit', 'secrets.toml')
+            
+            try:
+                with open(secrets_path, 'r') as f:
+                    secrets = toml.load(f)
+                    api_key = secrets.get("api_key")
+                    model_name = secrets.get("model_name")
+                    
+                    if not api_key:
+                        logging.error(f"[{thread_id}] API key not found in secrets.toml")
+                        return
+                        
+                    logging.info(f"[{thread_id}] Successfully loaded API key and model name")
+                    
+                    # Run the interview simulation
+                    transcript = simulate_interview(
+                        uxr_persona.uxr_persona_name, 
+                        uxr_persona.uxr_persona_desc, 
+                        persona.persona_name, 
+                        persona.persona_desc, 
+                        project.product_desc,
+                        api_key,
+                        model_name=model_name
+                    )
+                    
+                    logging.info(f"[{thread_id}] Interview simulation completed for persona: {persona.persona_name}")
+                    
+                    # Check if an interview already exists
+                    existing_interview = db.query(Interview).filter(
+                        Interview.persona_uuid == persona_uuid,
+                        Interview.uxr_persona_uuid == uxr_persona_uuid,
+                        Interview.project_uuid == project_uuid
+                    ).first()
+                    
+                    if existing_interview:
+                        logging.info(f"[{thread_id}] Interview already exists for persona {persona.persona_name}, skipping save")
+                    else:
+                        # Save the interview to the database
+                        logging.info(f"[{thread_id}] Saving interview to database for persona: {persona.persona_name}")
+                        
+                        # Create interview with transcript
+                        interview_uuid = f"{persona_uuid}-{uxr_persona_uuid}-{project_uuid}"
+                        new_interview = Interview(
+                            persona_uuid=persona_uuid,
+                            uxr_persona_uuid=uxr_persona_uuid,
+                            project_uuid=project_uuid,
+                            interview_transcript=json.dumps(transcript),
+                            interview_uuid=interview_uuid
+                        )
+                        
+                        db.add(new_interview)
+                        db.commit()
+                        logging.info(f"[{thread_id}] Successfully saved interview for persona: {persona.persona_name}")
+                    
+            except Exception as e:
+                logging.error(f"[{thread_id}] Error loading secrets or running interview: {str(e)}")
+                raise
+                
+        finally:
+            # Close the database session
+            db.close()
+            logging.info(f"[{thread_id}] Database session closed")
+            
     except Exception as e:
-        # Update status to error
-        st.session_state['interview_status'][persona_uuid] = "error"
-        st.session_state['interview_errors'][persona_uuid] = str(e)
+        logging.error(f"[{thread_id}] Unhandled error in interview thread: {str(e)}", exc_info=True)
 
 # --- Helper function for displaying interviews ---
 def display_interview(interview_transcript: str):
@@ -165,11 +249,11 @@ def display_interview(interview_transcript: str):
             for turn in conversation:
                 # Display researcher message with styling
                 st.markdown("**Researcher:**")
-                st.markdown(f"<div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin-bottom: 10px;'>{turn['researcher']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='background-color: #2e3440; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #88c0d0; color: #d8dee9;'>{turn['researcher']}</div>", unsafe_allow_html=True)
                 
                 # Display user message with different styling
                 st.markdown("**User:**")
-                st.markdown(f"<div style='background-color: #e6f3ff; padding: 10px; border-radius: 5px; margin-bottom: 20px;'>{turn['user']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='background-color: #3b4252; padding: 15px; border-radius: 8px; margin-bottom: 25px; border-left: 4px solid #a3be8c; color: #e5e9f0;'>{turn['user']}</div>", unsafe_allow_html=True)
     except json.JSONDecodeError:
         # Fallback to original display if JSON parsing fails
         st.write("Could not parse conversation format. Displaying raw transcript:")
@@ -275,7 +359,7 @@ def create_project_page():
         with st.spinner("Creating project... Please wait."):
             # LLM generated project name.
             prompt = get_project_name_prompt(user_group_desc, product_desc)
-            project_name = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
+            project_name = call_llm(prompt, st.secrets["api_key"], st.secrets[model_key])
         project = create_project(db, st.session_state['user_id'], user_group_desc, product_desc, project_name)
         st.session_state['current_project_uuid'] = project.project_uuid
         st.session_state['project_name'] = project.project_name
@@ -429,7 +513,7 @@ def project_main_page(project_uuid):
         st.write("Create persona archetypes based on user group and product description.")
         with st.spinner("Generating persona archetypes... This might take a few moments."):
             prompt = get_persona_archetypes_prompt(project.user_group_desc, project.product_desc)
-            response = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
+            response = call_llm(prompt, st.secrets["api_key"], st.secrets[model_key])
         archetypes_data = response.split("<archetype-")
         db = next(get_db()) #re-establish since call_llm closes it.
         for archetype_str in archetypes_data:
@@ -478,11 +562,11 @@ def project_main_page(project_uuid):
                                                      archetype.persona_archetype_desc,
                                                      existing_names,
                                                      project.product_desc)
-                response = call_llm(prompt, st.secrets["api_key"], st.secrets["model_name"])
+                response = call_llm(prompt, st.secrets["api_key"], st.secrets[model_key])
                 try:
                     persona_dict = parse_persona_response(response)
-                    name = persona_dict['name']
-                    desc = persona_dict['description']
+                    name = str(persona_dict['name'])
+                    desc = str(persona_dict['description'])
                     create_persona(db, project_uuid, archetype.persona_arch_uuid, name, desc)
                     existing_names.append(name)
                 except ValueError:
@@ -528,44 +612,21 @@ def project_main_page(project_uuid):
           if new_name != researcher.uxr_persona_name or new_desc != researcher.uxr_persona_desc:
               update_uxr_researcher(db, researcher.uxr_persona_uuid, {'uxr_persona_name': new_name, 'uxr_persona_desc': new_desc})
 
-        # --- Simulate Interviews ---
+    # --- Simulate Interviews ---
     st.header("Simulate Interviews")
-    
+
     personas = get_personas_by_project(db, project_uuid)
     researcher = get_uxr_researcher_by_project(db, project_uuid)
-    
+
     if not researcher:
         st.error("Please generate the UXR Researcher Persona first.")
     elif not personas:
         st.error("Please generate Specific Personas first.")
     else:
-        # Create dictionaries to store interview status and errors
-        if 'interview_status' not in st.session_state:
-            st.session_state['interview_status'] = {}
-        if 'interview_errors' not in st.session_state:
-            st.session_state['interview_errors'] = {}
-
-        # Check for completed interviews that need to be refreshed in UI
-        needs_rerun = False
-        for persona_uuid, status in st.session_state['interview_status'].items():
-            if status == "completed":
-                # Check if the interview exists in the database
-                interview = db.query(Interview).filter(
-                    Interview.persona_uuid == persona_uuid,
-                    Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
-                    Interview.project_uuid == project_uuid
-                ).first()
-                if interview:
-                    # Mark for rerun to update UI
-                    needs_rerun = True
-                    # Reset status after confirming it's in the database
-                    st.session_state['interview_status'][persona_uuid] = "viewed"
-        
-        if needs_rerun:
-            st.rerun()
-
-        # Display interview status and buttons
+        # Instead of relying on session state for interview status,
+        # check the database directly for each persona
         for persona in personas:
+            # Check if interview exists in database
             interview = db.query(Interview).filter(
                 Interview.persona_uuid == persona.persona_uuid,
                 Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
@@ -577,12 +638,6 @@ def project_main_page(project_uuid):
             with col1:
                 if interview:
                     st.info(f"Interview with {persona.persona_name} (Completed)")
-                elif persona.persona_uuid in st.session_state['interview_status']:
-                    if st.session_state['interview_status'][persona.persona_uuid] == "in_progress":
-                        st.warning(f"Interview with {persona.persona_name} in progress...")
-                    elif st.session_state['interview_status'][persona.persona_uuid] == "error":
-                        error_msg = st.session_state['interview_errors'].get(persona.persona_uuid, "Unknown error")
-                        st.error(f"Error occurred while interviewing {persona.persona_name}: {error_msg}")
                 else:
                     st.text(f"Interview with {persona.persona_name} not started")
 
@@ -592,7 +647,7 @@ def project_main_page(project_uuid):
                     if st.button("View", key=button_key):
                         st.session_state['selected_interview'] = interview.interview_uuid
                         st.rerun()
-                elif persona.persona_uuid not in st.session_state['interview_status'] or st.session_state['interview_status'][persona.persona_uuid] == "error":
+                else:
                     if st.button("Run", key=button_key):
                         # Start interview in background thread
                         thread = threading.Thread(
@@ -601,27 +656,45 @@ def project_main_page(project_uuid):
                         )
                         thread.daemon = True
                         thread.start()
+                        st.info(f"Interview with {persona.persona_name} started in background. Refresh the page in a minute to see results.")
                         st.rerun()
 
-        # Run all interviews button
+                # Run all interviews button
         if st.button("Run All Remaining Interviews"):
             remaining_personas = [p for p in personas if not db.query(Interview).filter(
                 Interview.persona_uuid == p.persona_uuid,
                 Interview.uxr_persona_uuid == researcher.uxr_persona_uuid,
                 Interview.project_uuid == project_uuid
             ).first()]
-
-            # Create a thread pool to run interviews concurrently
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                for persona in remaining_personas:
-                    executor.submit(
-                        run_interview_in_background,
-                        persona.persona_uuid,
-                        researcher.uxr_persona_uuid,
-                        project_uuid
-                    )
             
-            if remaining_personas:
+            if not remaining_personas:
+                st.info("All interviews have already been completed.")
+            else:
+                # Log the start of batch interview process
+                logging.info(f"Starting batch interview process for {len(remaining_personas)} personas")
+                st.info(f"Starting interviews for {len(remaining_personas)} personas. This will run in the background. Please do not close this page.")
+                
+                # Create a thread pool to run interviews concurrently
+                max_workers = min(3, len(remaining_personas))  # Don't create more threads than needed
+                logging.info(f"Creating ThreadPoolExecutor with max_workers={max_workers}")
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    for persona in remaining_personas:
+                        logging.info(f"Submitting interview task for persona: {persona.persona_name} (UUID: {persona.persona_uuid})")
+                        future = executor.submit(
+                            run_interview_in_background,
+                            persona.persona_uuid,
+                            researcher.uxr_persona_uuid,
+                            project_uuid
+                        )
+                        futures.append(future)
+                    
+                    logging.info(f"All {len(futures)} interview tasks have been submitted to the executor")
+                
+                logging.info("ThreadPoolExecutor has completed all tasks")
+                st.success("All interviews have been processed. Refresh the page to see results.")
+                time.sleep(2)  # Give a moment for the user to see the message
                 st.rerun()
 
         # Display interviews
@@ -640,12 +713,11 @@ def project_main_page(project_uuid):
             all_conversations = []
             for interview in interviews:
                 all_conversations.extend(json.loads(interview.interview_transcript)) 
-            clusters = cluster_sentences(all_conversations, st.secrets["api_key"], 
-                                        st.secrets["model_name"])
+            clusters = cluster_sentences(all_conversations, st.secrets["api_key"])
             cluster_summaries = summarize_each_cluster(clusters, st.session_state.product_desc, 
                                                     st.session_state.user_group_desc,
                                                     st.secrets["api_key"],
-                                                    st.secrets["model_name"])
+                                                    st.secrets[model_key])
             st.session_state['cluster_summaries'] = cluster_summaries
         for _, summary in cluster_summaries.items():
             with st.expander(f"Theme: {summary['theme']}"):
@@ -703,7 +775,7 @@ def project_main_page(project_uuid):
                             cluster_summaries, 
                             report_options, 
                             st.secrets["api_key"],
-                            st.secrets["model_name"]
+                            st.secrets[model_key]
                         )
                         
                         # Store the report in session state
