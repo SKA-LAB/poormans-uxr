@@ -713,7 +713,7 @@ def project_main_page(project_uuid):
             all_conversations = []
             for interview in interviews:
                 all_conversations.extend(json.loads(interview.interview_transcript)) 
-            clusters = cluster_sentences(all_conversations, st.secrets["api_key"])
+            clusters = cluster_sentences(all_conversations, st.secrets["api_key"], use_local=True)
             cluster_summaries = summarize_each_cluster(clusters, st.session_state.product_desc, 
                                                     st.session_state.user_group_desc,
                                                     st.secrets["api_key"],

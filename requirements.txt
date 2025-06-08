@@ -13,7 +13,10 @@ joblib>=1.2.0
 # LLM integration
 langchain>=0.0.267
 langchain-openai>=0.0.2
+langchain-together
 openai>=1.0.0
+sentence-transformers
+
 
 # Utilities
 pandas>=2.0.0

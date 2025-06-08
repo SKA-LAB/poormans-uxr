@@ -1,5 +1,5 @@
 import spacy
-from langchain_openai import OpenAIEmbeddings
+from langchain_together import TogetherEmbeddings
 from utils.app_config import CONFIG
 from sklearn.cluster import DBSCAN, OPTICS
 from sklearn.preprocessing import normalize
@@ -7,8 +7,11 @@ from joblib import Parallel, delayed
 from collections import defaultdict
 from utils.convo_utils import compute_silhoutte_score_for_cluster, run_kmeans
 from utils.interview_utils import get_chat_model
+from sentence_transformers import SentenceTransformer
 import numpy as np
 import logging
+import asyncio
+from typing import List
 import os
 
 # Set up logging with script name, line number, and timestamp
@@ -24,9 +27,9 @@ def call_llm(prompt: str, api_key: str, model_name: str) -> str:
     response = llm.invoke(prompt).content
     return response
 
-def cluster_sentences(single_transcript: list[dict], api_key: str) -> dict:
+def cluster_sentences(single_transcript: list[dict], api_key: str, use_local: bool=False) -> dict:
     sentences = extract_sentences(single_transcript)
-    embeddings = EmbedSentences(api_key).run(sentences)
+    embeddings = EmbedSentences(api_key, use_local).run(sentences)
     clusters = ClusterSentences(sentences, embeddings).run()
     return clusters
 
@@ -66,15 +69,44 @@ class EmbedSentences:
     Class to embed sentences using an embedding model.
     """
 
-    def __init__(self, api_key: str):
-        self.model = OpenAIEmbeddings(
-            model="togethercomputer/m2-bert-80M-32k-retrieval",
-            base_url="https://api.together.xyz/v1/embeddings",
-            api_key=api_key,
-        )
+    def __init__(self, api_key: str, use_local: bool=False):
+        self._use_local = use_local
+        if not use_local:
+            self.model = TogetherEmbeddings(
+                model="togethercomputer/m2-bert-80M-32k-retrieval",
+                api_key=api_key,
+            )
+        else:
+            self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+    async def aembed(self, sentences: list[str]) -> list:
+        """Async method to embed sentences with batching support."""
+        if not sentences:
+            return []
+            
+        # Batch size to avoid rate limits (adjust based on your specific limits)
+        batch_size = 100
+        all_embeddings = []
+        
+        # Process in batches
+        for i in range(0, len(sentences), batch_size):
+            batch = sentences[i:i+batch_size]
+            batch_embeddings = await self.model.aembed_documents(batch)
+            all_embeddings.extend(batch_embeddings)
+            
+            # Optional: Add a small delay between batches to avoid rate limits
+            if i + batch_size < len(sentences):
+                await asyncio.sleep(0.1)
+                
+        return all_embeddings
+
 
     def run(self, sentences: list[str]) -> list:
-        return self.model.embed_documents(sentences)
+        if not self._use_local:
+            # Run the async method in a synchronous context
+            return asyncio.run(self.aembed(sentences))
+        embeddings = self.model.encode(sentences, convert_to_numpy=True)
+        return embeddings.tolist() 
 
 
 class ClusterSentences:
