@@ -130,7 +130,7 @@ class ClusterSentences:
     
     def run(self) -> dict:
         if not self._optimize:
-            cluster_assignments = self.run_kmeans(num_clusters=np.sqrt(len(self._sentences)))
+            cluster_assignments = self.run_kmeans(num_clusters=int(np.sqrt(len(self._sentences))))
         else:
             max_clusters = min(100, int(1.5*np.sqrt(len(self._sentences))))
             logging.info(f"Optimizing clustering with max clusters {max_clusters}")

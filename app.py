@@ -54,7 +54,10 @@ import re
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import torch
 import logging
+
+torch.classes.__path__ = []  # to support sentence-transformers
 
 # Set up logging with script name, line number, and timestamp
 logging.basicConfig(
