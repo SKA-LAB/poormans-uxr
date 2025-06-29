@@ -1,7 +1,7 @@
 import streamlit as st
 import uuid
 import re
-from uxr_app.database import get_db, create_user, get_user_by_email, update_project
+from uxr_app.database import get_db, create_user, get_user_by_email, update_project, verify_password
 
 def is_logged_in():
     return st.session_state.get('logged_in', False)
@@ -22,7 +22,7 @@ def login_page(db_manager):
     password = st.text_input("Password", type="password")
     if st.button("Login"):
         user = db_manager.get_user_by_email(email)
-        if user and user.password == password:  # In real app, compare hashed passwords
+        if user and verify_password(user.password, password):
             st.session_state['logged_in'] = True
             st.session_state['user_id'] = user.user_id
             st.success("Logged in successfully!")
@@ -81,7 +81,7 @@ def show_auth_modal(state, db_manager):
             password = st.text_input("Password", type="password", key="login_password")
             if st.button("Login", key="login_button"):
                 user = db_manager.get_user_by_email(email)
-                if user and user.password == password:
+                if user and verify_password(user.password, password):
                     transfer_guest_data(state, db_manager, user.user_id)
                     state.login(user.user_id)
                     st.session_state['show_auth_modal'] = False

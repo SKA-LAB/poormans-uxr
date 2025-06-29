@@ -45,14 +45,18 @@ def simulate_interview(uxr_persona_name: str, uxr_persona_desc: str, persona_nam
 
     # Define the user researcher persona
     user_researcher_persona =f"""Your are the following persona:
-        Name:{uxr_persona_name}
-        Description: {uxr_persona_desc}
-        
-        You are currently gathering information and conducting interviews for a product focused 
-        on {product_desc}. Your primary goal is to understand the value proposition of this product and explore the 
-        problem space more completely. You are tasked with interviewing people who may be users of this product.
-        
-        You are interviewing someone right now."""
+Name:{uxr_persona_name}
+Description: {uxr_persona_desc}
+
+You are currently gathering information and conducting interviews for a product focused 
+on {product_desc}. Your primary goal is to understand the value proposition of this product and explore the 
+problem space more completely. You are tasked with interviewing people who may be future users of this product.
+
+Understand how the user behaves today to solve the problems that this product may address. Also understand 
+how the product should be defined to meet other requirements or needs the user may have related to the problems
+this product is targeted to address. 
+
+You are interviewing someone right now."""
     
     # Define the user persona
     user_persona = f"""Your are the following persona:

@@ -43,7 +43,7 @@ from utils.prompt_templates import (
     get_findings_prompt,
     get_demographics_prompt
 )
-from uxr_app.auth import (logout_user)
+from uxr_app.auth import (logout_user, verify_password)
 import json
 from utils.interview_utils import get_researcher_persona, simulate_interview
 from utils.convo_analysis import call_llm, cluster_sentences, summarize_each_cluster
@@ -272,7 +272,7 @@ def login_page():
         db = next(get_db())
         user = get_user_by_email(db, email)
         db.close()
-        if user and user.password == password:  # In real app, compare hashed passwords
+        if user and verify_password(user.password, password):
             st.session_state['logged_in'] = True
             st.session_state['user_id'] = user.user_id
             st.success("Logged in successfully!")
@@ -747,43 +747,38 @@ def project_main_page(project_uuid):
             include_appendix = st.checkbox("Include Appendix (Raw Interview Data)", value=False)
             
             if st.button("Generate Report"):
-                # Check if user is in guest mode
-                if st.session_state.get('guest_mode', False):
-                    st.session_state['show_auth_modal'] = True
-                    st.warning("Please log in or create an account to generate and download reports.")
-                else:
-                    with st.spinner("Generating comprehensive UXR report... This may take a few minutes."):
-                        # Get necessary data
-                        personas = get_personas_by_project(db, project_uuid)
-                        interviews = get_interviews_by_project(db, project_uuid)
-                        cluster_summaries = st.session_state['cluster_summaries']
-                        
-                        # Configure report options
-                        report_options = {
-                            'report_title': report_title,
-                            'include_exec_summary': include_exec_summary,
-                            'include_background': include_background,
-                            'include_demographics': include_demographics,
-                            'include_key_findings': include_key_findings,
-                            'include_detailed_analysis': include_detailed_analysis,
-                            'include_recommendations': include_recommendations,
-                            'include_appendix': include_appendix
-                        }
-                        
-                        # Generate the report
-                        _, full_report = generate_uxr_report(
-                            project, 
-                            personas, 
-                            interviews, 
-                            cluster_summaries, 
-                            report_options, 
-                            st.secrets["api_key"],
-                            st.secrets[model_key]
-                        )
-                        
-                        # Store the report in session state
-                        st.session_state['uxr_report'] = full_report
+                with st.spinner("Generating comprehensive UXR report... This may take a few minutes."):
+                    # Get necessary data
+                    personas = get_personas_by_project(db, project_uuid)
+                    interviews = get_interviews_by_project(db, project_uuid)
+                    cluster_summaries = st.session_state['cluster_summaries']
                     
+                    # Configure report options
+                    report_options = {
+                        'report_title': report_title,
+                        'include_exec_summary': include_exec_summary,
+                        'include_background': include_background,
+                        'include_demographics': include_demographics,
+                        'include_key_findings': include_key_findings,
+                        'include_detailed_analysis': include_detailed_analysis,
+                        'include_recommendations': include_recommendations,
+                        'include_appendix': include_appendix
+                    }
+                    
+                    # Generate the report
+                    _, full_report = generate_uxr_report(
+                        project, 
+                        personas, 
+                        interviews, 
+                        cluster_summaries, 
+                        report_options, 
+                        st.secrets["api_key"],
+                        st.secrets[model_key]
+                    )
+                    
+                    # Store the report in session state
+                    st.session_state['uxr_report'] = full_report
+                
                 # Display the generated report
                 st.markdown("### Report Preview")
                 st.markdown(st.session_state['uxr_report'])
@@ -792,89 +787,6 @@ def project_main_page(project_uuid):
             if 'uxr_report' in st.session_state:
                 st.subheader("Download Report")
                 
-                # Generate PDF
-                try:
-                    import pdfkit
-                    from jinja2 import Template
-                    import tempfile
-                    import base64
-                    
-                    # Create HTML from markdown
-                    import markdown
-                    html_content = markdown.markdown(st.session_state['uxr_report'])
-                    
-                    # Apply basic styling
-                    html_template = """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <meta charset="UTF-8">
-                        <title>{{ title }}</title>
-                        <style>
-                            body { font-family: Arial, sans-serif; line-height: 1.6; margin: 40px; }
-                            h1 { color: #333366; border-bottom: 1px solid #cccccc; padding-bottom: 10px; }
-                            h2 { color: #333366; margin-top: 30px; border-bottom: 1px solid #eeeeee; padding-bottom: 5px; }
-                            h3 { color: #444444; }
-                            blockquote { background-color: #f9f9f9; border-left: 4px solid #cccccc; padding: 10px; margin: 20px 0; }
-                            table { border-collapse: collapse; width: 100%; }
-                            th, td { border: 1px solid #dddddd; padding: 8px; text-align: left; }
-                            th { background-color: #f2f2f2; }
-                            .footer { margin-top: 50px; text-align: center; color: #666666; font-size: 0.8em; }
-                        </style>
-                    </head>
-                    <body>
-                        {{ content }}
-                        <div class="footer">
-                            Generated on {{ date }} with PoorMan's UXR
-                        </div>
-                    </body>
-                    </html>
-                    """
-                    
-                    template = Template(html_template)
-                    html = template.render(
-                        title=report_title,
-                        content=html_content,
-                        date=datetime.now().strftime("%B %d, %Y")
-                    )
-                    
-                    # Create PDF
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
-                        pdf_path = f.name
-                    
-                    # Configure PDF options
-                    options = {
-                        'page-size': 'A4',
-                        'margin-top': '20mm',
-                        'margin-right': '20mm',
-                        'margin-bottom': '20mm',
-                        'margin-left': '20mm',
-                        'encoding': "UTF-8",
-                        'no-outline': None
-                    }
-                    
-                    # Generate PDF
-                    pdfkit.from_string(html, pdf_path, options=options)
-                    
-                    # Create download button
-                    with open(pdf_path, "rb") as pdf_file:
-                        pdf_bytes = pdf_file.read()
-                    
-                    st.download_button(
-                        label="Download Report as PDF",
-                        data=pdf_bytes,
-                        file_name=f"{project.project_name}_UXR_Report.pdf",
-                        mime="application/pdf"
-                    )
-                    
-                    # Clean up temporary file
-                    import os
-                    os.unlink(pdf_path)
-                    
-                except ImportError:
-                    st.warning("PDF generation requires additional packages. Please install pdfkit and jinja2.")
-                    
-                # Also provide markdown download option as fallback
                 st.download_button(
                     label="Download Report as Markdown",
                     data=st.session_state['uxr_report'],
@@ -891,12 +803,14 @@ def project_main_page(project_uuid):
 # --- Main App Logic ---
 
 if not st.session_state['logged_in'] and not st.session_state['guest_mode']:
-    choice = st.sidebar.selectbox("Navigation", ["Login", "Create Account", "Continue as Guest"])
+    # Change the default selection to "Continue as Guest" instead of "Login"
+    choice = st.sidebar.selectbox("Navigation", ["Continue as Guest", "Login", "Create Account"])
+    
     if choice == "Login":
         login_page()
     elif choice == "Create Account":
         signup_page()
-    else: # Continue as Guest
+    else:  # Continue as Guest (now the default option)
         st.session_state['guest_mode'] = True
         st.session_state['guest_user_id'], guest_email, guest_password = create_guest_user()
         st.session_state['user_id'] = st.session_state['guest_user_id']
@@ -933,25 +847,25 @@ if st.session_state.get('show_auth_modal', False):
             if st.button("Login", key="login_button"):
                 db = next(get_db())
                 user = get_user_by_email(db, email)
-                db.close()
-                if user and user.password == password:
+                
+                if user and verify_password(user.password, password):
                     # Transfer guest data to logged in user
                     if st.session_state['guest_user_id']:
-                        db = next(get_db())
                         # Update projects to belong to the logged in user
                         for project_uuid in st.session_state.get('guest_projects', []):
                             project = get_project_by_uuid(db, project_uuid)
                             if project:
-                                update_project(db, project_uuid, {'user_id': new_user.user_id})
-                        db.close()
+                                update_project(db, project_uuid, {'user_id': user.user_id})
                     
                     st.session_state['logged_in'] = True
                     st.session_state['guest_mode'] = False
                     st.session_state['user_id'] = user.user_id
                     st.session_state['show_auth_modal'] = False
                     st.success("Logged in successfully!")
+                    db.close()
                     st.rerun()
                 else:
+                    db.close()
                     st.error("Invalid credentials.")
         
         with auth_tab2:
@@ -981,13 +895,12 @@ if st.session_state.get('show_auth_modal', False):
                             for project_uuid in st.session_state.get('guest_projects', []):
                                 project = get_project_by_uuid(db, project_uuid)
                                 if project:
-                                    project.user_id = new_user.user_id
-                                    db.commit()
-                        db.close()
+                                    update_project(db, project_uuid, {'user_id': new_user.user_id})
                         
                         st.session_state['logged_in'] = True
                         st.session_state['guest_mode'] = False
                         st.session_state['user_id'] = new_user.user_id
                         st.session_state['show_auth_modal'] = False
                         st.success("Account created successfully! Your work has been transferred to your new account.")
+                        db.close()
                         st.rerun()

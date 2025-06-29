@@ -1,10 +1,10 @@
 import sqlite3
 import hashlib
+import uuid
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, ARRAY
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.dialects.sqlite import BLOB  # Import BLOB
 from datetime import datetime
-from uuid import uuid4
 
 Base = declarative_base()
 
@@ -101,8 +101,18 @@ def init_db():
 
 # --- Helper DB Functions ---
 def create_user(db, email, password):
-    user_id = hashlib.md5((email + password).encode()).hexdigest()
-    new_user = User(email=email, password=password, user_id=user_id)  # Hash password!
+    # Hash the password for secure storage
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    
+    # Generate a unique user ID
+    user_id = str(uuid.uuid4())
+    
+    new_user = User(
+        email=email, 
+        password=hashed_password,  # Store the hashed password
+        user_id=user_id
+    )
+    
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -110,6 +120,11 @@ def create_user(db, email, password):
 
 def get_user_by_email(db, email):
     return db.query(User).filter(User.email == email).first()
+
+def verify_password(stored_password, provided_password):
+    """Verify a stored password against one provided by user"""
+    hashed_provided = hashlib.sha256(provided_password.encode()).hexdigest()
+    return stored_password == hashed_provided
 
 def create_project(db, user_id, user_group_desc, product_desc, project_name):
     project_uuid = hashlib.md5((project_name + user_group_desc + product_desc + user_id).encode()).hexdigest()
@@ -145,7 +160,7 @@ def get_personas_by_project(db, project_uuid):
     return db.query(Persona).filter(Persona.project_uuid == project_uuid).all()
 
 def create_uxr_researcher(db, project_uuid, name, desc):
-    uxr_persona_uuid = str(uuid4())
+    uxr_persona_uuid = str(uuid.uuid4())
     new_researcher = UXRResearcher(project_uuid=project_uuid, uxr_persona_name=name, uxr_persona_desc=desc, uxr_persona_uuid=uxr_persona_uuid)
     db.add(new_researcher)
     db.commit()
@@ -174,6 +189,7 @@ def update_project(db, project_uuid, update_data):
         db.commit()
         db.refresh(project)
     return project
+
 def update_persona_archetype(db, persona_arch_uuid, update_data):
     archetype = db.query(PersonaArchetype).filter(PersonaArchetype.persona_arch_uuid == persona_arch_uuid).first()
     if archetype:

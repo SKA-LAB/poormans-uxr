@@ -206,7 +206,7 @@ def summarize_sentences(sentences: str, product_description: str,
     and 2-5 sample sentences from the list above that help support your choice of the theme and the description. 
     Respond in the following format:
 
-    <description> your description here...  </description>
+    <description> your description and summary of the content here...  </description>
     <theme> your theme title here...  </theme>
     <sample_sentences>
     1. [sample_sentence]
@@ -231,7 +231,7 @@ def keep_theme(theme: str, theme_desc: str, product_description: str, user_descr
     User-group Description: {user_description}
 
     Your task is to decide if this theme and description is relevant to the product and user group. For instance, some
-    themes may be about clusters of introductory sentences or interjections that do not directly relate to user research 
+    themes may be about introductory sentences, polite exchanges, excited responses, or interjections that do not directly relate to user research 
     insights. Take at least 3-5 steps to reason through your answer but take more steps, as needed. 
     Include all of your reasoning within <thinking> tags. Then answer with only TRUE -- if the theme is relevant -- or FALSE --if the theme 
     is irrelevant. For example, 
